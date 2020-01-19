@@ -1,0 +1,109 @@
+#-------------------------------------- Chnage Log -------------------------------------------
+__author__ = "Anup Kumar"
+__copyright__ = "Copyright 2019, KAPSARC EIM Project"
+__credits__ = ["Anup Kumar"]
+__license__ = "Prop"
+__version__ = "1.0.0"
+__maintainer__ = "Anup Kumar"
+__email__ = "anup.kumar@kapsarc.org"
+__status__ = "Production"
+#------------------------------------ Change Details ------------------------------------------
+# 09/10/2019 - Anup Kumar - FTP to AWS
+#----------------------------------------------------------------------------------------------
+
+import os, datetime
+import airflow
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.python_operator import PythonOperator
+from airflow.hooks.S3_hook import S3Hook
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+DIR_PATH = os.path.abspath(os.path.dirname(__file__))
+
+def push_file_to_aws(DIR_PATH):
+    for root, direc, files in os.walk(os.path.join(DIR_PATH, '_Input', 'KDS')):
+        for each_file in files:
+            s3_hook = S3Hook(aws_conn_id='s3_conn')
+            s3_hook.get_conn()
+            local_path = os.path.join(DIR_PATH, '_Input', 'KDS', each_file)
+            s3_hook.load_file(filename=local_path, key=each_file, bucket_name=Variable.get("s3_datasets_bucket_name"), replace=True)
+            clear_folders(DIR_PATH, 'KDS', each_file)
+    return
+
+# def get_files(DIR_PATH):
+#     for root, direc, files in os.walk(os.path.join(DIR_PATH, '_Input', 'KDS')):
+#         return files
+
+def clear_folders(DIR_PATH, FOLDER_NAME, FILE_NAME):
+    try:
+        os.remove(os.path.join(DIR_PATH, '_Input', FOLDER_NAME, FILE_NAME))
+        return "Success"
+    except ValueError:
+        raise ValueError("Unable to remove the input file")
+
+# def each_id_dag(DIR_PATH, idx, each_file, main_dag_id, start_date, schedule_interval):
+#     dag = DAG(
+#     '%s.%s' % (main_dag_id, str(int(idx))),
+#     schedule_interval=schedule_interval,
+#     start_date=start_date,
+#     )
+
+#     push_to_aws = PythonOperator(
+#         task_id = 'push_file_to_aws',
+#         python_callable=push_file_to_aws,
+#         op_kwargs={'DIR_PATH': DIR_PATH, 'each_file': each_file},
+#         start_date=airflow.utils.dates.days_ago(0),
+#         dag=dag
+#     )
+
+#     delete_file = PythonOperator(
+#                     task_id="delete_file", 
+#                     python_callable=clear_folders,
+#                     op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': 'KDS', 'FILE_NAME': each_file},
+#                     dag=dag
+#                 )
+
+#     push_to_aws >> delete_file
+#     return dag
+
+default_args = {
+    'owner': 'Anup Kumar',
+    'depends_on_past': False,
+    'start_date': airflow.utils.dates.days_ago(1),
+    'email': [Variable.get("alert_email_to")],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': datetime.timedelta(minutes=10)
+}
+
+main_dag = DAG(
+    'kds-ftp-to-aws',
+    default_args=default_args,
+    description='World Daily Spot Prices for Crude Oil WTI and Brent',
+    schedule_interval='15 12 * * *',
+)
+
+start_task = DummyOperator(task_id="Start", dag=main_dag)
+end_task = DummyOperator(task_id="End", dag=main_dag)
+
+push_to_aws = PythonOperator(
+    task_id = 'push_file_to_aws',
+    python_callable=push_file_to_aws,
+    op_kwargs={'DIR_PATH': DIR_PATH},
+    start_date=airflow.utils.dates.days_ago(0),
+    dag=main_dag
+)
+
+start_task >> push_to_aws >> end_task
+# files_list = get_files(DIR_PATH)
+# for idx, each_file in enumerate(files_list):
+#     sub_dag = SubDagOperator(
+#             subdag=each_id_dag(DIR_PATH, idx, each_file, 'kds-ftp-to-aws', main_dag.default_args['start_date'], main_dag.schedule_interval),
+#             task_id=str(int(idx)),
+#             dag=main_dag,
+#         )
+
+#     start_task >> sub_dag >> end_task

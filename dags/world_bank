@@ -1,0 +1,277 @@
+#-------------------------------------- Chnage Log -------------------------------------------
+__author__ = "Anup Kumar"
+__copyright__ = "Copyright 2017, KAPSARC EIM Project"
+__credits__ = ["Anup Kumar"]
+__license__ = "Prop"
+__version__ = "1.0.0"
+__maintainer__ = "Anup Kumar"
+__email__ = "anup.kumar@kapsarc.org"
+__status__ = "Production"
+#------------------------------------ Change Details ------------------------------------------
+# 11/01/2017 - Anup Kumar - Downloading the WB datasets, unzipping and renaming it to the kds-id
+# 03/01/2018 - Anup Kumar - Changed the way the files are downloaded due to change in the website structure
+# 08/25/2019 - Anup Kumar - Migrating to airflow and bug fixes
+# 09/10/2019 - Anup Kumar - Updated the FTP to AWS
+#----------------------------------------------------------------------------------------------
+
+import os, requests, time, csv, datetime, sys, zipfile, json, shutil, re
+from urllib.request import urlopen, urlretrieve
+from urllib.parse import quote, urlparse, urljoin
+from requests.auth import HTTPBasicAuth
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+from bs4 import BeautifulSoup
+import pandas as pd
+import numpy as np
+import airflow
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.hooks.postgres_hook import PostgresHook
+from airflow.hooks.S3_hook import S3Hook
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+DIR_PATH = os.path.abspath(os.path.dirname(__file__))
+DATASET_ROWS_THRESHOLD = 800000
+COUNTRY_LIST = ["Saudi Arabia", "Bahrain", "Kuwait", "Oman", "Qatar", "India", "China"]
+
+def flatten(container):
+    for i in container:
+        if isinstance(i, (list,tuple)):
+            for j in flatten(i):
+                yield j
+        else:
+            yield i
+
+def get_urls(DIR_PATH, WB_URL, WB_OUTPUT_FILE_TYPE, WB_URL_FILE_TYPE, WB_PAGE_TYPE):
+    if WB_PAGE_TYPE == 'CATALOG':
+        try:
+            # Disable flag warning
+            requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+            response = requests.get(WB_URL, verify=False, auth=('root', 'icinga'))
+        except ValueError:
+            raise ValueError('Error 404: Issue with the file download', e)
+
+        url_html = response.content
+
+        WB_CHECK = 'EXCEL' if WB_OUTPUT_FILE_TYPE == 'XLS' else 'CSV'
+        WB_CHECK_FILE_EXT = WB_CHECK + WB_URL_FILE_TYPE.upper() if WB_URL_FILE_TYPE == '.zip' else WB_URL_FILE_TYPE.upper() 
+
+        soup = BeautifulSoup(url_html, 'html.parser')
+        data = soup.findAll('div', attrs={'class': 'go_resource'})
+        
+        for div in data:
+            a_links = div.findAll('a')
+            for a_link in a_links:
+                if a_link['href'].lower().endswith(WB_URL_FILE_TYPE.lower()) and a_link['href'].lower().endswith(WB_CHECK_FILE_EXT.lower()):
+                    download_file(a_link['href'], WB_URL_FILE_TYPE, DIR_PATH)
+                    file_name = a_link['href'].rsplit('/', 1)[-1]
+                    break
+    return file_name
+
+def download_file(url, WB_URL_FILE_TYPE, DIR_PATH):
+    if get_url_ext(url) == '.zip':
+        download_folder = os.path.join(DIR_PATH, '_Input', url.rsplit('/', 1)[-1])
+    else:
+        download_folder = os.path.join(DIR_PATH, '_Output', 'WorldBank', url.rsplit('/', 1)[-1])
+    try:
+        #Downloading the file
+        urlretrieve(url, download_folder)
+        if get_url_ext(url) == '.zip':
+            #Unzipping
+            if not os.path.exists(os.path.join(DIR_PATH, '_Output', 'WorldBank')):
+                os.makedirs(os.path.join(DIR_PATH, '_Output', 'WorldBank'))
+            zipped_file = zipfile.ZipFile(download_folder, 'r')
+            zipped_file.extractall(os.path.join(DIR_PATH, '_Output', 'WorldBank'))
+            zipped_file.close()
+    except ValueError:
+        raise ValueError('Error 404: Issue with the file download')
+
+def get_url_ext(url):
+    parsed = urlparse(url)
+    root, ext = os.path.splitext(parsed.path)
+    return ext
+
+def generate_output(DIR_PATH, DATASET_ROWS_THRESHOLD, KDS_ID, WB_OUTPUT_FILE_TYPE, WB_URL_FILE_TYPE, COUNTRY_LIST, zip_file_name):
+    if WB_OUTPUT_FILE_TYPE == 'CSV' and KDS_ID != 'worldbank-population':
+        output_columns_list = ["Country Name", "Indicator Name", "Year", "Value", "Unit of measure", "Periodicity", "Aggregation method"]
+
+        if zip_file_name.endswith(WB_URL_FILE_TYPE):
+            file_name_pattern = zip_file_name[:-8]
+        
+        dfData = pd.read_csv(os.path.join(DIR_PATH, '_Output', 'WorldBank', file_name_pattern + 'Data.csv'))
+        dfmeltData = pd.melt(dfData, id_vars=["Country Name", "Country Code", "Indicator Name", "Indicator Code"], var_name="Year", value_name="Value")
+        dfSeries = pd.read_csv(os.path.join(DIR_PATH, '_Output', 'WorldBank', file_name_pattern + 'Series.csv'))
+
+        dfMergedData = pd.merge(dfmeltData,dfSeries,on='Indicator Name', how='left')[output_columns_list]
+        dfMergedData = dfMergedData.dropna(subset=['Value']) 
+
+        if len(dfMergedData.index) >= DATASET_ROWS_THRESHOLD:
+            dfMergedData = dfMergedData[dfMergedData['Country Name'].isin(COUNTRY_LIST)]
+
+        dfMergedData.to_csv(os.path.join(DIR_PATH, '_Output', KDS_ID + '.csv'),mode = 'w', index=False)
+    elif WB_OUTPUT_FILE_TYPE == 'CSV' and KDS_ID == 'worldbank-population':
+        dfData = pd.read_csv(os.path.join(DIR_PATH, '_Output', 'WorldBank', 'POP.csv'))
+        filtered_data = dfData.dropna(how='all')
+        filtered_data = filtered_data.dropna(axis='columns', how='all')
+        filtered_data.to_csv(os.path.join(DIR_PATH, '_Output', KDS_ID + '.csv'),mode = 'w', index=False)
+    elif WB_OUTPUT_FILE_TYPE == 'XLS' and KDS_ID == 'climate-change-worldbank-data':
+        if zip_file_name.endswith(WB_URL_FILE_TYPE):
+            file_name = zip_file_name
+        dfData = pd.read_excel(os.path.join(DIR_PATH, '_Output', file_name), sheetname='Data')
+        dfmeltData = pd.melt(dfData, id_vars=["Country code", "Country name", "Series code", "Series name", "SCALE", "Decimals"], var_name="Year", value_name="Value")
+        filtered_data = dfmeltData.dropna(subset=['Value'])
+        if len(filtered_data.index) >= DATASET_ROWS_THRESHOLD:
+            filtered_data = filtered_data[filtered_data['Country name'].isin(COUNTRY_LIST)]
+        filtered_data.to_csv(os.path.join(DIR_PATH, '_Output', KDS_ID + '.csv'),mode = 'w', index=False)
+    return
+
+def get_datasets():
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT kds_id, wb_url, wb_page_type, wb_output_file_type, wb_url_file_type FROM lkp.wb where automation_type = 'PYTHON' and kds_dataset_relation = 'PARENT'")
+    columns = [column[0] for column in src_cursor.description]
+    datasets = [dict(zip(columns, row)) for row in src_cursor.fetchall()]
+    src_cursor.close()
+    src_conn.close()
+    return datasets
+
+def clear_folders(DIR_PATH, FOLDER_NAME, FILE_NAME):
+    try:
+        os.remove(os.path.join(DIR_PATH, FOLDER_NAME, FILE_NAME))
+        return "Success"
+    except ValueError:
+        raise ValueError("Unable to remove the input file")
+
+def push_to_aws(kds_id):
+    s3_hook = S3Hook(aws_conn_id='s3_conn')
+    s3_hook.get_conn()
+    local_path = os.path.join(DIR_PATH, '_Output', kds_id+'.csv')
+    s3_hook.load_file(filename=local_path, key=kds_id+'.csv', bucket_name=Variable.get("s3_datasets_bucket_name"), replace=True)
+    return "Sucess: Pushed the output"
+
+def get_dataset_uid(dataset_id):
+    try:
+        res = requests.get(Variable.get("kds_api_url") + "catalog/datasets/" + dataset_id, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res.json()['dataset']['dataset_uid']
+    except ValueError:
+        raise ValueError("Error: While getting the dataset uid")
+
+def update_dataset_metadata(uid, template, metadata_name, attribute, value):
+    payload = '{"value": "'+value+'" , "override_remote_value": true}'
+    try:
+        res = requests.put(Variable.get("kds_api_management_url") + '/' + uid + '/' + template + '/' + metadata_name + '/' + attribute, data=payload, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res
+    except ValueError:
+        raise ValueError("Error while updating metadata on KDS")
+
+def publish(dataset_id):
+    dataset_uid = get_dataset_uid(dataset_id)
+    update_metadata = update_dataset_metadata(dataset_uid, 'metadata', 'custom', 'last-checked-date', datetime.datetime.now().strftime("%Y-%m-%d"))
+    if update_metadata.status_code == 200:
+        try:
+            response = requests.put(Variable.get("kds_api_management_url") + '/' + dataset_uid + '/publish/', auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+            return response.json()
+        except ValueError:
+            raise ValueError("Error while publishing the dataset_uid")
+
+def delete_folder(DIR_PATH, FOLDER, SUB_FOLDER_NAME):
+    if os.path.exists(os.path.join(DIR_PATH, FOLDER, SUB_FOLDER_NAME)):
+        shutil.rmtree(os.path.join(DIR_PATH, FOLDER, SUB_FOLDER_NAME))
+    return
+
+def each_id_dag(DIR_PATH, dataset, main_dag_id, start_date, schedule_interval):
+    dag = DAG(
+    '%s.%s' % (main_dag_id, str(dataset['kds_id'])),
+    schedule_interval=schedule_interval,
+    start_date=start_date,
+    )
+
+    download_file = PythonOperator(
+                    task_id = 'download_file',
+                    python_callable=get_urls,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'WB_URL': dataset['wb_url'], 'WB_OUTPUT_FILE_TYPE': dataset['wb_output_file_type'], 'WB_URL_FILE_TYPE': dataset['wb_url_file_type'], 'WB_PAGE_TYPE': dataset['wb_page_type']},
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+    process_dataset = PythonOperator(
+                    task_id = 'process_dataset',
+                    python_callable=generate_output,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'DATASET_ROWS_THRESHOLD': DATASET_ROWS_THRESHOLD, 'KDS_ID': dataset['kds_id'], 'WB_OUTPUT_FILE_TYPE': dataset['wb_output_file_type'], 'WB_URL_FILE_TYPE': dataset['wb_url_file_type'], 'COUNTRY_LIST': COUNTRY_LIST, 'zip_file_name': "{{ task_instance.xcom_pull(task_ids='download_file', key='return_value') }}" },
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+    load_dataset_to_aws = PythonOperator(
+                    task_id="push_to_aws", 
+                    python_callable=push_to_aws,
+                    op_kwargs={'kds_id': dataset['kds_id']},
+                    dag=dag
+                )
+
+    publish_dataset = PythonOperator(
+                    task_id="PublishDataset", 
+                    python_callable=publish,
+                    op_kwargs={'dataset_id': dataset['kds_id']},
+                    dag=dag
+                )
+                
+    clear_inputs = PythonOperator(
+                    task_id="ClearInput", 
+                    python_callable=clear_folders,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Input', 'FILE_NAME': "{{ task_instance.xcom_pull(task_ids='download_file', key='return_value') }}"},
+                    dag=dag
+                )
+
+    clear_outputs = PythonOperator(
+                    task_id="ClearOutput", 
+                    python_callable=clear_folders,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Output', 'FILE_NAME': str(dataset['kds_id'])+'.csv'},
+                    dag=dag
+                )
+
+    download_file >> process_dataset >> load_dataset_to_aws >> publish_dataset >> clear_inputs >> clear_outputs
+    return dag
+
+default_args = {
+    'owner': 'Anup Kumar',
+    'depends_on_past': False,
+    'start_date': airflow.utils.dates.days_ago(1),
+    'email': [Variable.get("alert_email_to")],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': datetime.timedelta(minutes=10)
+}
+
+main_dag = DAG(
+    'WorldBank',
+    default_args=default_args,
+    description='World Bank Datasets',
+    schedule_interval='45 12 * * *',
+)
+
+start_task = DummyOperator(task_id="Start", dag=main_dag)
+end_task = DummyOperator(task_id="End", dag=main_dag)
+
+delete_world_bank_folder = PythonOperator(
+                    task_id="ClearOutput", 
+                    python_callable=delete_folder,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Output', 'SUB_FOLDER_NAME': 'WorldBank'},
+                    dag=main_dag
+                )
+
+datasets = get_datasets()
+for dataset in datasets:
+    sub_dag = SubDagOperator(
+            subdag=each_id_dag(DIR_PATH, dataset, 'WorldBank', main_dag.default_args['start_date'], main_dag.schedule_interval),
+            task_id=str(dataset['kds_id']),
+            dag=main_dag,
+        )
+
+    start_task >> sub_dag >> delete_world_bank_folder >> end_task

@@ -1,0 +1,462 @@
+#-------------------------------------- Chnage Log -------------------------------------------
+__author__ = "Anup Kumar"
+__copyright__ = "Copyright 2019, KAPSARC EIM Project"
+__credits__ = ["Anup Kumar"]
+__license__ = "Prop"
+__version__ = "1.0.0"
+__maintainer__ = "Anup Kumar"
+__email__ = "anup.kumar@kapsarc.org"
+__status__ = "Production"
+#------------------------------------ Change Details ------------------------------------------
+# 02/05/2019 - Anup Kumar - DWatcher intial code
+# 06/24/2019 - Anup Kumar - Multiprocessing and modified the initial logic
+# 07/04/2019 - Anup Kumar - Modified the dates logic
+# 08/20/2019 - Anup Kumar - Driver status to close
+# 08/26/2019 - Anup Kumar - Migration to airflow
+# 08/27/2019 - Anup Kumar - Bug Fixes
+#----------------------------------------------------------------------------------------------
+
+import os, platform, requests, hashlib, datetime, smtplib, time, random, csv, json, socket, http.client
+from io import StringIO
+from tqdm import tqdm
+from requests.auth import HTTPBasicAuth
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as ec
+from selenium.webdriver.remote.command import Command
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException
+from bs4 import BeautifulSoup
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from requests.auth import HTTPBasicAuth
+import airflow
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.hooks.postgres_hook import PostgresHook
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+DIR_PATH = os.path.abspath(os.path.dirname(__file__))
+
+def main(owner_row):
+    email_list = []
+    metajson = get_dataset_metadata()
+    owner_datasets = get_owner_datasets(owner_row['Owner_Email'])
+    for row in tqdm(owner_datasets):
+        email_dict = {}
+        email_dict["Title"] = row['dataset_title'].strip()
+        email_dict["Theme"] = row['main_theme'].strip()
+        email_dict['Dataset_Country'] = row['dataset_country'].strip() if row['dataset_country'] is not None else ''
+        email_dict['Publisher'] = row['publisher'].strip() if row['publisher'] is not None else ''
+        email_dict["Owner"] = row['Owner_Name'].strip()
+        email_dict["Owner_Email"] = row['Owner_Email'].strip()
+        email_dict["Support"] = row['Support_Name'].strip()
+        email_dict["Support_Email"] = row['Support_Email'].strip()
+        email_dict["Ref_link"] = row['references'].strip() if row['references'] is not None else '' 
+        ref_xpath = get_ref_xpath(row['dataset_id'].strip())
+        if 'references' in row:
+            dataset_uid = get_dataset_uid(metajson, row['dataset_id'].strip())
+            ldb_status = get_ldb_status(dataset_uid)
+            last_load_date = get_load_date(dataset_uid)
+            print (dataset_uid)
+
+            #If Last checked date is null
+            if row['last_checked_date'] is None:
+                email_dict["Color"] = "#FFA500"
+                email_dict["Priority"] = 2
+                email_dict["Remarks"] = "Please update the metadata like last-checked-date, discountined."
+            elif 'eri.org.cn' in row['references']:
+                # Updating the last checked date
+                update_dataset(dataset_uid, 'metadata', 'custom', 'last-checked-date', datetime.datetime.now().strftime("%Y-%m-%d"))
+                # Updating the local db
+                update_dwatcher(type="update", is_error="NO", multiple_updates="YES", update_values=[{"LAST_LOAD_DATE": datetime.datetime.utcnow(), "PREV_HASH": None, "PREV_HASH_DATE": datetime.datetime.utcnow()}], kds_uid=dataset_uid)
+                email_dict["Color"] = "#008000"
+                email_dict["Priority"] = 3
+                email_dict["Remarks"] = "Successfully updated the last checked date"
+            #If Last checked date is less than yesterday time
+            # elif ((row['last_checked_date']-datetime.datetime.utcfromtimestamp(0)).total_seconds()*1000) <= (((datetime.datetime.today() - datetime.timedelta(1)) - datetime.datetime.utcfromtimestamp(0)).total_seconds() * 1000):
+            else:
+                # Get Current Hash
+                try:
+                    currentHash = getWebHash(row['references'].strip(), ref_xpath)
+                except Exception as e:
+                    print ("Error while getting hash for dataset_uid " + dataset_uid)
+                    if ldb_status == "YES":
+                        error_message = 'Unknown error with noneType'
+                        update_dwatcher(type="update", is_error="YES", multiple_updates="YES", update_values=[{"IS_ERROR": "YES"}, {"ERROR_MESSAGE": error_message}, {"ERROR_OCCURED_DATE": datetime.datetime.utcnow()}, {"LAST_LOAD_DATE": datetime.datetime.utcnow()}], kds_uid=dataset_uid)
+                    email_dict["Color"] = "#FFA500"
+                    email_dict["Priority"] = 2
+                    email_dict["Remarks"] = "Error while getting the source"
+                    email_list.append(email_dict)
+                    continue
+                    # break
+
+                # Check if the dataset is already in the lcoal db
+                if ldb_status == "YES":
+                    prevHashDate = getPrevWebHashDate(row['dataset_id'].strip())
+                    if (currentHash == str(getPrevWebHash(row['dataset_id'].strip()))) and ((datetime.datetime(prevHashDate.year, prevHashDate.month, prevHashDate.day)-datetime.datetime.utcfromtimestamp(0)).total_seconds()*1000 == (row['last_checked_date']-datetime.datetime.utcfromtimestamp(0)).total_seconds()*1000):
+                        # Updating the last checked date
+                        update_dataset(dataset_uid, 'metadata', 'custom', 'last-checked-date', datetime.datetime.now().strftime("%Y-%m-%d"))
+                        # Updating the local db
+                        update_dwatcher(type="update", is_error="NO", multiple_updates="YES", update_values=[{"LAST_LOAD_DATE": datetime.datetime.utcnow(), "PREV_HASH": currentHash, "PREV_HASH_DATE": datetime.datetime.utcnow()}], kds_uid=dataset_uid)
+                        email_dict["Color"] = "#008000"
+                        email_dict["Priority"] = 3
+                        email_dict["Remarks"] = "Successfully updated the last checked date"
+                    else:
+                        # Updating the local db
+                        update_dwatcher(type="update", is_error="NO", multiple_updates="NO", update_values=[{"LAST_LOAD_DATE": datetime.datetime.utcnow(), "PREV_HASH": currentHash, "PREV_HASH_DATE": datetime.datetime.utcnow()}], kds_uid=dataset_uid)
+                        email_dict["Color"] = "#FF0000"
+                        email_dict["Priority"] = 1
+                        email_dict["Remarks"] = "There is a change in the source"
+                else:
+                    update_dwatcher(type="insert", is_error="NO", insert_values=(row['dataset_id'].strip(), dataset_uid, currentHash, datetime.datetime.utcnow(), datetime.datetime.utcnow(), "NO"))
+                    email_dict["Color"] = "#FF0000"
+                    email_dict["Priority"] = 1
+                    email_dict["Remarks"] = "This is a new dataset"
+        else:
+            email_dict["Color"] = "#FF0000"
+            email_dict["Priority"] = 1
+            email_dict["Remarks"] = "No Reference Link"
+        email_list.append(email_dict)
+    return email_list
+
+def get_ref_xpath(dataset_id):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT ref_xpath FROM lkp.kds_ref WHERE kds_id = '"'{}'"' and ref_xpath is not null".format(dataset_id))
+    if src_cursor.rowcount == 0:
+        ref_xpath = ''
+    else:
+        ref_xpath = src_cursor.fetchone()[0]
+    src_cursor.close()
+    src_conn.close()
+    return ref_xpath.rstrip()
+
+def get_owner_datasets(owner_email):
+    pg_db = PostgresHook(postgres_conn_id='pg_tableau')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT A.dataset_id, A.dataset_title, A.main_theme, A.references, A.last_checked_date, B."'"Owner_Name"'", B."'"Owner_Email"'", B."'"Support_Name"'", B."'"Support_Email"'", A.dataset_country, A.publisher FROM dbo.kds_catalog A INNER JOIN dbo.kds_theme_owner as B on A.main_theme = B."'"Upper_Theme"'" WHERE A.published = True and A.is_automated = False and A.discontinued = False and A.main_theme != 'PUBLICATION DATA' and A.main_theme != 'KAPSARC PUBLICATIONS' and A.main_theme != 'KAPSARC MODELS' and A.main_theme != 'MODEL DATA' and A.publisher != 'King Abdullah Petroleum Studies and Research Center' and B."'"Owner_Email"'" = '"'{}'"'".format(owner_email.strip()))
+    columns = [column[0] for column in src_cursor.description]
+    owner_datasets = [dict(zip(columns, row)) for row in src_cursor.fetchall()]
+    src_cursor.close()
+    src_conn.close()
+    return owner_datasets
+
+def get_theme_owners():
+    pg_db = PostgresHook(postgres_conn_id='pg_tableau')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT DISTINCT "'"Owner_Email"'", "'"Owner_Name"'" FROM dbo.kds_theme_owner where "'"Owner_Email"'" is not null and "'"Owner_Email"'" != '' order by "'"Owner_Email"'" desc")
+    columns = [column[0] for column in src_cursor.description]
+    theme_owners_list = [dict(zip(columns, row)) for row in src_cursor.fetchall()]
+    src_cursor.close()
+    src_conn.close()
+    return theme_owners_list
+
+def getPrevWebHash(dataset_id):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT prev_hash FROM lkp.d_watcher WHERE kds_id = '"'{}'"'".format(dataset_id))
+    if src_cursor.rowcount == 0:
+        prevHash = ''
+    else:
+        prevHash = src_cursor.fetchone()[0]
+    src_cursor.close()
+    src_conn.close()
+    return prevHash.rstrip()
+
+def getPrevWebHashDate(dataset_id):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT prev_hash_date FROM lkp.d_watcher WHERE kds_id = '"'{}'"'".format(dataset_id))
+    if src_cursor.rowcount == 0:
+        prevHashDate = ''
+    else:
+        prevHashDate = src_cursor.fetchone()[0]
+    src_cursor.close()
+    src_conn.close()
+    return prevHashDate
+
+def getWebHash(url, xpath):
+    sourcePage = getSource(url, xpath)
+    return hashlib.sha1(sourcePage.encode('utf-8')).hexdigest()
+
+def update_dataset(uid, template, metadata_name, attribute, value):
+    payload = '{"value": "'+value+'" , "override_remote_value": true}'
+    try:
+        res = requests.put(Variable.get("kds_api_management_url") + '/' + uid + '/' + template + '/' + metadata_name + '/' + attribute, data=payload, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            publish(uid)
+            return res.json()
+    except Exception as e:
+        print ("Error while updating "+attribute+" for dataset_uid "+uid)
+        error_message = 'Unknown error with noneType'
+        update_dwatcher(type="update", is_error="YES", multiple_updates="YES", update_values=[{"IS_ERROR": "YES"}, {"ERROR_MESSAGE": error_message}, {"ERROR_OCCURED_DATE": datetime.datetime.utcnow()}, {"LAST_LOAD_DATE": datetime.datetime.utcnow()}], kds_uid=uid)
+        return
+
+def publish(uid):
+    try:
+        response = requests.put(Variable.get("kds_api_management_url") + '/' + uid + '/publish/', auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        return response.json()
+    except Exception as e:
+        print ("Error while publishing the dataset_uid " + uid)
+        error_message = 'Unknown error with noneType'
+        update_dwatcher(type="update", is_error="YES", multiple_updates="YES", update_values=[{"IS_ERROR": "YES"}, {"ERROR_MESSAGE": error_message}, {"ERROR_OCCURED_DATE": datetime.datetime.utcnow()}, {"LAST_LOAD_DATE": datetime.datetime.utcnow()}], kds_uid=uid)
+        return
+
+def update_dwatcher(*args, **kwargs):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    if kwargs.get('type', "insert") == 'insert':
+        if kwargs.get('is_error', None) == 'YES':
+           src_cursor.execute("INSERT INTO lkp.d_watcher(kds_id, kds_uid, prev_hash, prev_hash_date, last_load_date, is_error, error_message, error_occured_date) VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')" % kwargs.get('insert_values'))
+        else:
+            src_cursor.execute("INSERT INTO lkp.d_watcher(kds_id, kds_uid, prev_hash, prev_hash_date, last_load_date, is_error) VALUES ('%s', '%s', '%s', '%s', '%s', '%s')" % kwargs.get('insert_values'))
+        src_conn.commit()
+    elif kwargs.get('type', "insert") == 'update':
+        if kwargs.get('multiple_updates', None) == 'YES':
+            for item in kwargs.get('update_values'):
+                for k, v in item.items():
+                    src_cursor.execute("UPDATE lkp.d_watcher SET {} = '"'{}'"' WHERE kds_uid = '"'{}'"'".format(k, v, kwargs.get('kds_uid')))
+                    src_conn.commit()
+        else:
+            for item in kwargs.get('update_values'):
+                for k, v in item.items():
+                    src_cursor.execute("UPDATE lkp.d_watcher SET {} = '"'{}'"' WHERE kds_uid = '"'{}'"'".format(k, v, kwargs.get('kds_uid')))
+                    src_conn.commit()
+    src_cursor.close()
+    src_conn.close()
+    return
+
+def get_load_date(kds_uid):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT last_load_date FROM lkp.d_watcher WHERE kds_uid = '"'{}'"'".format(kds_uid))
+    result_row = src_cursor.fetchone()
+    if result_row is not None:
+        src_cursor.close()
+        src_conn.close()
+        return (result_row[0]-datetime.datetime.utcfromtimestamp(0)).total_seconds()*1000
+    else:
+        src_cursor.close()
+        src_conn.close()
+        return
+
+def get_ldb_status(kds_uid):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT kds_uid FROM lkp.d_watcher WHERE kds_uid = '"'{}'"'".format(kds_uid))
+    result_row = src_cursor.fetchone()
+    if result_row is not None:
+        src_cursor.close()
+        src_conn.close()
+        return "YES"
+    else:
+        src_cursor.close()
+        src_conn.close()
+        return "NO"
+
+def get_dataset_metadata():
+    try:
+        res = requests.get(Variable.get("kds_api_management_url") + "?rows=-1", auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res.json()
+    except Exception as e:
+        print (e)
+        return
+
+def get_dataset_uid(metajson, dataset_id):
+    for dataset in metajson['datasets']:
+        if dataset_id == dataset['dataset_id']:
+            return dataset['dataset_uid']
+
+def get_browser_status(driver):
+    try:
+        driver.execute(Command.STATUS)
+        return "Alive"
+    except (socket.error, http.client.CannotSendRequest):
+        return "Dead"
+
+def getSource(url, xpath):
+    sourceTex = None
+    chrome_options = Options()
+    # chrome_options.add_argument("--headless")
+    browser = webdriver.Remote(Variable.get("selenium_hub"), chrome_options.to_capabilities())
+    try:
+        browser.get(url)
+        browser.maximize_window()
+    except TimeoutException as e:
+        print ("TimeoutException Error", e)
+        browser.quit()
+
+    if browser:
+        # wait for element to appear, then hover it
+        wait = WebDriverWait(browser, 15)
+        notFound = True
+        count = 0
+        while notFound:
+            try:
+                if xpath == '':
+                    xpath = '/html/body'
+                time.sleep(3)
+                body_wait = wait.until(ec.visibility_of_element_located((By.XPATH, xpath)))
+                notFound = False
+                sourceTex = str(body_wait.text.replace('\n', '').replace(' ', ''))
+                browser.quit()
+            except Exception as e:
+                browser.refresh()
+                count = count + 1
+                print ('looping to check element exists :' + str(count))
+                if count > 5:
+                    notFound = False
+                    print ('Element not found after 5 occurences..Exit from loop!!!')
+                    browser.quit()
+    return sourceTex
+
+def build_html(tbl_list):
+    html = """<html><table border="1">
+            <tr><th>Title</th><th>Theme</th><th>Reference</th><th>Owner</th><th>Support</th><th>Remarks</th></tr>"""
+    sorted_tbl_list = sorted(tbl_list, key=lambda d: d['Priority'], reverse=False)
+    for row in sorted_tbl_list:
+        html += "<tr bgcolor={}>".format(row['Color'])
+        html += "<td>{}</td>".format(row['Title'])+"<td>{}</td>".format(row['Theme'])+"<td><a href='"'{}'"'>Reference Link</td>".format(row['Ref_link'])+"<td>{}</td>".format(row['Owner'])+"<td>{}</td>".format(row['Support'])+"<td>{}</td>".format(row['Remarks'].strip())
+        html += "</tr>"
+    html += "</table></html>"
+    return html
+
+def unique_values_set(list_of_dict, key_name):
+    unique_values_list = []
+    for kv in list_of_dict:
+         unique_values_list.append(kv[key_name])
+    unique_values = set(val for val in unique_values_list)
+    return unique_values
+
+def send_email(subject, tbl_list, *args, **kwargs):
+    tbl_list = eval(tbl_list)
+    # CSV Buffer
+    csv_buffer = write_csv_buffer(tbl_list)
+    dwatch_csv_file = MIMEText(csv_buffer.getvalue())
+    attachment = dwatch_csv_file.add_header('Content-Disposition', 'attachment', filename="datasets.csv")
+
+    # Email
+    emaillist = []
+    emaillist.append(','.join(str(s) for s in unique_values_set(tbl_list, 'Support_Email')))
+    emaillist.append(','.join(str(s) for s in unique_values_set(tbl_list, 'Owner_Email')))
+    emaillist.append('amar.amarnath@kapsarc.org')
+    emaillist.append('anup.kumar@kapsarc.org')
+    msg = MIMEMultipart()
+    msg['Subject'] = subject
+    msg['From'] = Variable.get("smtp_username")
+    msg['To'] = ", ".join(emaillist)
+    html = """\
+    <html>
+    <head></head>
+    <body>
+        Dear {0},
+        <br /><br />
+        There is a source change in the below datasets highlighted in <b>"RED"</b>.
+        <br /><br />Color coding,
+        <br /><br />
+        <b>Red</b>: Change in source website. [ACTION REQUIRED]<br />
+        <b>Amber</b>: Metadata like last checked date or discountinued is missing. [ACTION REQUIRED]<br />
+        <b>Green</b>: Updated last checked date automatically, as there is no change in source website. [NO ACTION REQUIRED]
+        <br /><br />
+         {1}
+        <br /><br />
+        EIM Group
+    </body>
+    </html>
+    """.format(','.join(str(s) for s in unique_values_set(tbl_list, 'Owner')), build_html(tbl_list))
+
+    msg.attach(MIMEText(html, 'html'))
+    msg.attach(dwatch_csv_file)
+
+    server = smtplib.SMTP('outlook.office365.com', 587)
+    server.ehlo()
+    server.starttls()
+    server.ehlo()
+    try:
+        server.login(msg['From'], Variable.get("smtp_password"))
+        server.sendmail(msg['From'], emaillist , msg.as_string())
+        server.quit()
+    except Exception as e:
+        print (e)
+        server.quit()
+    return
+
+def write_csv_buffer(output_list):
+    csv_buffer = StringIO()
+    column_keys = [col for col in output_list[0].keys()]
+    dict_writer = csv.DictWriter(csv_buffer, fieldnames=column_keys)
+    dict_writer.writeheader()
+    for row in output_list:
+        dict_writer.writerow(row)
+    return csv_buffer
+
+def each_id_dag(DIR_PATH, theme_owner, main_dag_id, start_date, schedule_interval):
+    dag = DAG(
+    '%s.%s' % (main_dag_id, str(theme_owner['Owner_Name'])),
+    schedule_interval=schedule_interval,
+    start_date=start_date,
+    )
+
+    watcher = PythonOperator(
+                    task_id = 'watcher',
+                    python_callable=main,
+                    op_kwargs={'owner_row': theme_owner},
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+    sending_email = PythonOperator(
+                    task_id="email", 
+                    python_callable=send_email,
+                    op_kwargs={'subject': "Action Request, There is a source update to your datasets", 'tbl_list': "{{ task_instance.xcom_pull(task_ids='watcher', key='return_value') }}"},
+                    dag=dag
+                )
+
+    watcher >> sending_email
+    return dag
+
+default_args = {
+    'owner': 'Anup Kumar',
+    'depends_on_past': False,
+    'start_date': airflow.utils.dates.days_ago(1),
+    'email': [Variable.get("alert_email_to")],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': datetime.timedelta(minutes=10)
+}
+
+main_dag = DAG(
+    'DWatcher',
+    default_args=default_args,
+    description='KAPSARC Data Source Datasets Watcher',
+    schedule_interval='15 4 * * *',
+)
+
+start_task = DummyOperator(task_id="Start", dag=main_dag)
+end_task = DummyOperator(task_id="End", dag=main_dag)
+
+theme_owners = get_theme_owners()
+for each_theme_owner in theme_owners:
+    sub_dag = SubDagOperator(
+            subdag=each_id_dag(DIR_PATH, each_theme_owner, 'DWatcher', main_dag.default_args['start_date'], main_dag.schedule_interval),
+            task_id=str(each_theme_owner['Owner_Name']),
+            dag=main_dag,
+        )
+
+    start_task >> sub_dag >> end_task

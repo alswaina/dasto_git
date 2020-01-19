@@ -1,0 +1,488 @@
+#-------------------------------------- Chnage Log -------------------------------------------
+__author__ = "Anup Kumar"
+__copyright__ = "Copyright 2017, KAPSARC EIM Project"
+__credits__ = ["Anup Kumar"]
+__license__ = "Prop"
+__version__ = "1.0.0"
+__maintainer__ = "Anup Kumar"
+__email__ = "anup.kumar@kapsarc.org"
+__status__ = "Production"
+#------------------------------------ Change Details ------------------------------------------
+# 10/04/2018 - Anup Kumar - GlobalEnergyObservatory crawler with data processing to outputs
+# 08/20/2019 - Anup Kumar - Migrating to airflow
+# 09/10/2019 - Anup Kumar - Updated the FTP to AWS
+#----------------------------------------------------------------------------------------------
+
+import os, requests, datetime, time, sys, json
+from urllib.parse import urlparse, parse_qs, urljoin
+from bs4 import BeautifulSoup
+import pandas as pd
+from urllib.request import urlopen, urlretrieve
+from urllib.parse import quote
+from requests.auth import HTTPBasicAuth
+import airflow
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.hooks.postgres_hook import PostgresHook
+from airflow.hooks.S3_hook import S3Hook
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+DIR_PATH = os.path.abspath(os.path.dirname(__file__))
+MAIN_URL = "http://www.globalenergyobservatory.org"
+LIST_OF_ATTRIBUTES = [
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Country_Assigned_Identification_Number",
+        "FIELD_HEADER": "PLANT_COUNTRY_ASSIGNED_IDENTIFICATION_NUMBER"
+    },
+    {
+        "FIELD_TYPE": "select",
+        "FIELD_ID": "Status_of_Plant_enumfield_itf",
+        "FIELD_HEADER": "PLANT_STATUS"
+    },
+    {
+        "FIELD_TYPE": "select",
+        "FIELD_ID": "Plant_Efficiency_and_Impact_enumfield_itf",
+        "FIELD_HEADER": "PLANT_EFFICIENT_AND_IMPACT"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Plant_Overall_Rating_setfield_itf_###_State-of-the-art",
+        "FIELD_HEADER": "PLANT_OVERALL_RATING"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Plant_Overall_Rating_setfield_itf_###_Worth Duplicating",
+        "FIELD_HEADER": "PLANT_OVERALL_RATING"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Plant_Overall_Rating_setfield_itf_###_Environmentally Responsible",
+        "FIELD_HEADER": "PLANT_OVERALL_RATING"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "GEO_Assigned_Identification_Number",
+        "FIELD_HEADER": "PLANT_GEO_ASSIGNED_ID_NUMBER"
+    },
+    {
+        "FIELD_TYPE": "select",
+        "FIELD_ID": "Currency_enum",
+        "FIELD_HEADER": "PLANT_CURRENCY"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Latitude_Start",
+        "FIELD_HEADER": "PLANT_LATITUDE"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Longitude_Start",
+        "FIELD_HEADER": "PLANT_LONGITUDE"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Firm_Capacity_(MWe)_nbr",
+        "FIELD_HEADER": "PLANT_FIRM_CAPACITY_MWE"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Heat_Supply_Capacity_(MWth)_nbr",
+        "FIELD_HEADER": "PLANT_HEAT_SUPPY_CAPACITY_MWE"
+    },
+    {
+        "FIELD_TYPE": "select",
+        "FIELD_ID": "Type_of_Plant_enumfield_rng1",
+        "FIELD_HEADER": "PLANT_TYPE_OF_PLANT"
+    },
+    {
+        "FIELD_TYPE": "select",
+        "FIELD_ID": "Power_Plant_Used_For_enumfield",
+        "FIELD_HEADER": "PLANT_USED_FOR"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Type_of_Fuel_rng1_Primary",
+        "FIELD_HEADER": "PLANT_FUEL_TYPE_PRIMARY"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Location",
+        "FIELD_HEADER": "PLANT_LOCATION"
+    },
+    {
+        "FIELD_TYPE": "select",
+        "FIELD_ID": "Type_of_Fuel_enumfield_rng2_Secondary",
+        "FIELD_HEADER": "PLANT_FUEL_TYPE_SECONDARY"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Configuration_of_Boiler/Turbine/Gen",
+        "FIELD_HEADER": "PLANT_CONFIGURATION_OF_BOILER_TURBINE_GEN"
+    },
+    {
+        "FIELD_TYPE": "select",
+        "FIELD_ID": "Electric_Power_Grid_Connected_To_enumfield_rng1",
+        "FIELD_HEADER": "PLANT_ELECTRIC_POWER_GRID_CONNECTED_TO"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "EPGC_To_rng2_Name/Operator",
+        "FIELD_HEADER": "PLANT_EPGC_OPERATOR_NAME"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "EPGC_To_rng3_PPA(years)",
+        "FIELD_HEADER": "PLANT_EPGC_PPA_YEARS"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Name_of_SubStation_Connected_To",
+        "FIELD_HEADER": "PLANT_NAME_OF_SUBSTATION_CONNECTED_TO"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Source_of_Coal_rng1",
+        "FIELD_HEADER": "PLANT_SOURCE_OF_COAL"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Source_Coal_rng2_Onsite_Storage_Capacity_(Tonnes)_nbr",
+        "FIELD_HEADER": "PLANT_ONSITE_STORAGE_CAPACITY_TONNES"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Kilometers_to_Coal_Mines_(Average)_rng1_nbr",
+        "FIELD_HEADER": "PLANT_AVG_KILOMETERS_TO_COAL_MINES"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Kilometers_rng2_Name_of_Major_Mines",
+        "FIELD_HEADER": "PLANT_NAME_OF_MAJOR_MINES"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Type_of_Cooling_System",
+        "FIELD_HEADER": "PLANT_TYPE_OF_COOLING_SYSTEM"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Source_of_Cooling_Water_rng1",
+        "FIELD_HEADER": "PLANT_SOURCE_OF_COOLING_WATER"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Source_of_Cooling_Water_rng2_Rate_(cum/day)_nbr",
+        "FIELD_HEADER": "PLANT_SOURCE_COOLING_WATER_RATE_CUM_PER_DAY"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Source_of_Makeup_Water_rng1",
+        "FIELD_HEADER": "PLANT_SOURCE_OF_MAKEUP_WATER"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Source_of_Makeup_Water_rng2_Rate_(cum/day)_nbr",
+        "FIELD_HEADER": "PLANT_SOURCE_OF_MAKEUP_WATER_CUM_PER_DAY"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Water_Withdrawal_Rate_at_Full_Power_rng1_nbr_(cum/hour)",
+        "FIELD_HEADER": "PLANT_WATER_WITHDRAWAL_RATE_AT_FULL_POWER_CUM_PER_HOUR"
+    },
+    {
+        "FIELD_TYPE": "select",
+        "FIELD_ID": "Cogen_Mode:_Steam_Supplied_To_enumfield_rng1",
+        "FIELD_HEADER": "PLANT_COGEN_MODE_STEAM_SUPPLIED_TO"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Steam_Supplied_To_rng2_(Tonnes/hour)_nbr",
+        "FIELD_HEADER": "PLANT_STEAM_SUPPLIED_TONNES_PER_HOUR"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Steam_Supplied_To_rng3_Description",
+        "FIELD_HEADER": "PLANT_STEAM_SUPPLIED_DESCRIPTION"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Environmental_Issues",
+        "FIELD_HEADER": "PLANT_ENVIRONMENTAL_ISSUES"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Capital_Cost_of_Plant_nbr_rng1",
+        "FIELD_HEADER": "PLANT_CAPITAL_COST"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Capital_Cost_of_Plant_rng2_and/or_In_US_Dollars_nbr",
+        "FIELD_HEADER": "PLANT_CAPITAL_COST_IN_US_DOLLARS"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Capital_Cost_Currency_rng3_In_Year_(YYYY)_yr",
+        "FIELD_HEADER": "PLANT_CAPITAL_COST_REPORTED_YEAR"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Mercury_Control_Device",
+        "FIELD_HEADER": "PLANT_MERCURY_CONTROL_DEVICE"
+    },
+    {
+        "FIELD_TYPE": "select",
+        "FIELD_ID": "SOx_Control_Device_Type_enum",
+        "FIELD_HEADER": "PLANT_SOX_CONTROL_DEVICE_TYPE"
+    },
+    {
+        "FIELD_TYPE": "select",
+        "FIELD_ID": "NOx_Control_Device_Type_enum",
+        "FIELD_HEADER": "PLANT_NOX_CONTROL_DEVICE_TYPE"
+    },
+    {
+        "FIELD_TYPE": "select",
+        "FIELD_ID": "Particulates(PM)_Control_Device_Type_enum",
+        "FIELD_HEADER": "PLANT_PARTICULATES_PM_CONTROL_DEVICE_TYPE"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Type_of_Ownership",
+        "FIELD_HEADER": "PLANT_TYPE_OF_OWNERSHIP"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Construction/EPC_Contractor",
+        "FIELD_HEADER": "PLANT_EPC_CONTRACTOR"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Operating_Company",
+        "FIELD_HEADER": "PLANT_OPERATING_COMPANY"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Regulatory_Authority",
+        "FIELD_HEADER": "PLANT_REGULATORY_AUTHORITY"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "Project_Financed_By",
+        "FIELD_HEADER": "PLANT_PROJECT_FINANCED_BY"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "References1",
+        "FIELD_HEADER": "PLANT_REFERENCES_01"
+    },
+    {
+        "FIELD_TYPE": "input",
+        "FIELD_ID": "References2",
+        "FIELD_HEADER": "PLANT_REFERENCES_02"
+    }
+]
+
+LIST_OF_CATEGORIES = ['POWERPLANTS']
+LIST_OF_COUNTRIES = ['']
+KDS_ID = 'world-power-plants-list'
+
+def get_category_urls(MAIN_URL, LIST_OF_CATEGORIES):
+    soup = get_requests_soup(MAIN_URL)
+    cat_urls_list = []
+    for link in soup.find_all("li", {"class": ["even", "odd"]}):
+        for cat_type in LIST_OF_CATEGORIES:
+            if cat_type == parse_qs(urlparse(link.a.get("href").upper()).query)["DB"][0]:
+                data_dict = {}
+                data_dict["Topic"] = parse_qs(urlparse(link.a.get("href").upper()).query)["DB"][0]
+                data_dict["Type"] = parse_qs(urlparse(link.a.get("href").upper()).query)["TYPE"][0]
+                data_dict["Type_URL"] = urljoin(MAIN_URL, link.a.get("href"))
+                cat_urls_list.append(data_dict)
+    return cat_urls_list
+
+def get_requests_soup(URL):
+    headers = requests.utils.default_headers()
+    headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:52.0) Gecko/20100101 Firefox/52.0",
+    })
+    try:
+        res = requests.get(URL)
+        return BeautifulSoup(res.content, "html.parser")
+    except ValueError:
+        raise ValueError("Error: While getting the soup")
+
+def get_each_cat(DIR_PATH, cat_urls_list, FILE_UUID, LIST_OF_ATTRIBUTES):
+    cat_urls_list = cat_urls_list.replace("\'", "\"").encode("utf-8")
+    cat_urls_list = json.loads(cat_urls_list)
+    print (cat_urls_list)
+    cat_type_plant_list = []
+    for each_cat_url in cat_urls_list:
+        print (each_cat_url)
+        soup = get_requests_soup(each_cat_url["Type_URL"])
+        for row in soup.find_all("tr", {"class": ["odd_perf", "even_perf"]}):
+            try:
+                plant_dict = {}
+                plant_dict["PLANT_URL"] = urljoin(MAIN_URL, row.contents[0].a.get("href"))
+                plant_dict["PLANT_NAME"] = row.contents[0].a.text.encode('utf-8').decode('ascii', 'ignore').strip()
+                plant_dict["PLANT_DESIGN_CAPACITY_MWE"] = row.contents[1].text.encode('utf-8').decode('ascii', 'ignore').strip()
+                plant_dict["PLANT_COUNTRY"] = row.contents[2].text.encode('utf-8').decode('ascii', 'ignore').strip()
+                plant_dict["PLANT_STATE"] = row.contents[3].text.encode('utf-8').decode('ascii', 'ignore').strip()
+                plant_soup = get_requests_soup(urljoin(MAIN_URL, row.contents[0].a.get("href")))
+                for div_elem in plant_soup.find_all("div", {"id": "Abstract_Block"}):
+                    for td_tag in div_elem.find_all("td"):
+                        plant_dict["PLANT_ABSTRACT"] = td_tag.text.encode('utf-8').decode('ascii', 'ignore').strip()
+                    for each_attr in LIST_OF_ATTRIBUTES:
+                        if each_attr["FIELD_TYPE"] == "input":
+                            plant_dict[each_attr["FIELD_HEADER"]] = plant_soup.find("input", {"id": each_attr["FIELD_ID"]}).get("value").encode('utf-8').decode('ascii', 'ignore').strip() if plant_soup.find("input", {"id": each_attr["FIELD_ID"]}) else ''
+                        elif each_attr["FIELD_TYPE"] == "select":
+                            plant_dict[each_attr["FIELD_HEADER"]] = plant_soup.find("select", {"id": each_attr["FIELD_ID"]}).find('option', selected=True).get('value').encode('utf-8').decode('ascii', 'ignore').strip() if plant_soup.find("select", {"id": each_attr["FIELD_ID"]}) else ''
+                plant_dict["TOPIC"] = each_cat_url["Topic"].encode('utf-8').decode('ascii', 'ignore').strip()
+                plant_dict["TYPE"] = each_cat_url["Type"].encode('utf-8').decode('ascii', 'ignore').strip()
+                plant_dict["TYPE_URL"] = each_cat_url["Type_URL"].encode('utf-8').decode('ascii', 'ignore').strip()
+                cat_type_plant_list.append(plant_dict)
+            except:
+                plant_dict["TOPIC"] = each_cat_url["Topic"].encode('utf-8').decode('ascii', 'ignore').strip()
+                plant_dict["TYPE"] = each_cat_url["Type"].encode('utf-8').decode('ascii', 'ignore').strip()
+                plant_dict["TYPE_URL"] = each_cat_url["Type_URL"].encode('utf-8').decode('ascii', 'ignore').strip()
+                cat_type_plant_list.append(plant_dict)
+                pass
+    cols = ["PLANT_URL", "PLANT_NAME", "PLANT_DESIGN_CAPACITY_MWE", "PLANT_COUNTRY", "PLANT_STATE"]
+    extra_cols = [each_attr["FIELD_HEADER"] for each_attr in LIST_OF_ATTRIBUTES]
+    cols.extend(extra_cols)
+    cols.extend(["TOPIC", "TYPE", "TYPE_URL"])
+    df = pd.DataFrame(cat_type_plant_list, columns=cols)
+    df = df.replace('Please Select', '')
+    df.to_csv(os.path.join(DIR_PATH, '_Output', FILE_UUID +'.csv'), index=False, encoding='utf8')
+    return
+
+def get_datasets():
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT file_uuid, geo_url FROM lkp.geo")
+    columns = [column[0] for column in src_cursor.description]
+    datasets = [dict(zip(columns, row)) for row in src_cursor.fetchall()]
+    src_cursor.close()
+    src_conn.close()
+    return datasets
+
+def clear_folders(DIR_PATH, FOLDER_NAME, FILE_NAME):
+    try:
+        os.remove(os.path.join(DIR_PATH, FOLDER_NAME, FILE_NAME))
+        return "Success"
+    except ValueError:
+        raise ValueError("Unable to remove the input file")
+
+def push_to_aws(kds_id):
+    s3_hook = S3Hook(aws_conn_id='s3_conn')
+    s3_hook.get_conn()
+    local_path = os.path.join(DIR_PATH, '_Output', kds_id+'.csv')
+    s3_hook.load_file(filename=local_path, key=kds_id+'.csv', bucket_name=Variable.get("s3_datasets_bucket_name"), replace=True)
+    return "Sucess: Pushed the output"
+
+def get_dataset_uid(dataset_id):
+    try:
+        res = requests.get(Variable.get("kds_api_url") + "catalog/datasets/" + dataset_id, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res.json()['dataset']['dataset_uid']
+    except ValueError:
+        raise ValueError("Error: While getting the dataset uid")
+
+def update_dataset_metadata(uid, template, metadata_name, attribute, value):
+    payload = '{"value": "'+value+'" , "override_remote_value": true}'
+    try:
+        res = requests.put(Variable.get("kds_api_management_url") + '/' + uid + '/' + template + '/' + metadata_name + '/' + attribute, data=payload, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res
+    except ValueError:
+        raise ValueError("Error while updating metadata on KDS")
+
+def publish(dataset_id):
+    dataset_uid = get_dataset_uid(dataset_id)
+    update_metadata = update_dataset_metadata(dataset_uid, 'metadata', 'custom', 'last-checked-date', datetime.datetime.now().strftime("%Y-%m-%d"))
+    if update_metadata.status_code == 200:
+        try:
+            response = requests.put(Variable.get("kds_api_management_url") + '/' + dataset_uid + '/publish/', auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+            return response.json()
+        except ValueError:
+            raise ValueError("Error while publishing the dataset_uid")
+
+def each_id_dag(DIR_PATH, dataset, main_dag_id, start_date, schedule_interval):
+    dag = DAG(
+    '%s.%s' % (main_dag_id, str(dataset['file_uuid'])),
+    schedule_interval=schedule_interval,
+    start_date=start_date,
+    )
+
+    extract_category_urls = PythonOperator(
+                    task_id = 'extract_category_urls',
+                    python_callable=get_category_urls,
+                    op_kwargs={'MAIN_URL': MAIN_URL, 'LIST_OF_CATEGORIES': LIST_OF_CATEGORIES},
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+    process_dataset = PythonOperator(
+                    task_id = 'process_dataset',
+                    python_callable=get_each_cat,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'cat_urls_list': "{{ task_instance.xcom_pull(task_ids='extract_category_urls', key='return_value') }}", 'FILE_UUID': dataset['file_uuid'], 'LIST_OF_ATTRIBUTES': LIST_OF_ATTRIBUTES },
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+    load_dataset_to_aws = PythonOperator(
+                    task_id="push_to_aws", 
+                    python_callable=push_to_aws,
+                    op_kwargs={'kds_id': dataset['file_uuid']},
+                    dag=dag
+                )
+
+    publish_dataset = PythonOperator(
+                    task_id="PublishDataset", 
+                    python_callable=publish,
+                    op_kwargs={'dataset_id': KDS_ID},
+                    dag=dag
+                )
+
+    clear_outputs = PythonOperator(
+                    task_id="ClearOutput", 
+                    python_callable=clear_folders,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Output', 'FILE_NAME': str(dataset['file_uuid'])+'.csv'},
+                    dag=dag
+                )
+
+    extract_category_urls >> process_dataset >> load_dataset_to_aws >> publish_dataset >> clear_outputs
+    return dag
+
+default_args = {
+    'owner': 'Anup Kumar',
+    'depends_on_past': False,
+    'start_date': airflow.utils.dates.days_ago(1),
+    'email': [Variable.get("alert_email_to")],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': datetime.timedelta(minutes=10)
+}
+
+main_dag = DAG(
+    'GlobalEnergyObservatory',
+    default_args=default_args,
+    description='Global Energy Observatory',
+    schedule_interval='0 9 1 * *',
+)
+
+start_task = DummyOperator(task_id="Start", dag=main_dag)
+end_task = DummyOperator(task_id="End", dag=main_dag)
+
+datasets = get_datasets()
+for dataset in datasets:
+    sub_dag = SubDagOperator(
+            subdag=each_id_dag(DIR_PATH, dataset, 'GlobalEnergyObservatory', main_dag.default_args['start_date'], main_dag.schedule_interval),
+            task_id=str(dataset['file_uuid']),
+            dag=main_dag,
+        )
+
+    start_task >> sub_dag >> end_task

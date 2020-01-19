@@ -1,0 +1,252 @@
+#-------------------------------------- Chnage Log -------------------------------------------
+__author__ = "Anup Kumar"
+__copyright__ = "Copyright 2019, KAPSARC EIM Project"
+__credits__ = ["Anup Kumar"]
+__license__ = "Prop"
+__version__ = "1.0.0"
+__maintainer__ = "Anup Kumar"
+__email__ = "anup.kumar@kapsarc.org"
+__status__ = "Production"
+#------------------------------------ Change Details ------------------------------------------
+# 02/14/2019 - Anup Kumar - CMEGroup crude oil future trading price
+# 05/27/2019 - Anup Kumar - Fixed the bug in related to the source and AJAX
+# 08/25/2019 - Anup Kumar - Migration to airflow
+# 09/10/2019 - Anup Kumar - Updated the FTP to AWS
+#----------------------------------------------------------------------------------------------
+
+import os, requests, time, csv, datetime, json, sys, platform
+from requests.auth import HTTPBasicAuth
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as ec
+from selenium.webdriver.common.by import By
+import pandas as pd
+import airflow
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.hooks.postgres_hook import PostgresHook
+from airflow.hooks.S3_hook import S3Hook
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+DIR_PATH = os.path.abspath(os.path.dirname(__file__))
+CME_URL = 'https://www.cmegroup.com/trading/energy/crude-oil/brent-crude-oil-last-day_quotes_globex_options.html#optionProductId=7950&strikeRange=ATM'
+KDS_ID = 'cme-brent-crude-oil-futures-style-margin-option'
+
+def extract_data(DIR_PATH, KDS_ID, CME_URL):
+    soup = bs_extract(DIR_PATH, CME_URL)
+    timestamp = datetime.datetime.utcnow()
+    cme_expirations = soup.find("select",{"id":"cmeOptionExpiration"})
+    cme_list = []
+    for cme_expiration in cme_expirations.find_all("option"):
+        print (cme_expiration)
+        exp_url = "https://www.cmegroup.com/CmeWS/mvc/Quotes/Option/{0}/G/{1}/ATM?optionProductId={2}&strikeRange=ATM&pageSize=500".format(cme_expiration['value'].split("-")[0], cme_expiration['value'].split("-")[1], cme_expiration['value'].split("-")[0])
+        try:
+            exp_json = requests.get(exp_url).json()
+        except ValueError:
+            raise ValueError("Error: Fetching the JSON")
+        for quote in exp_json['optionContractQuotes']:
+            new_dict = {}
+            for k, v in quote.items():
+                if isinstance(v, dict):
+                    for nk, nv in v.items():
+                        new_dict[k +"_" + nk] = nv
+                else:
+                   new_dict[k] = v
+            new_dict['load_timestamp'] = timestamp
+            new_dict['month'] = cme_expiration.text.split(" ")[0]
+            new_dict['year'] = cme_expiration.text.split(" ")[1]
+            new_dict['month_year'] = datetime.datetime.strptime(cme_expiration.text, '%b %Y')
+            new_dict['indicator'] = soup.find("span", {"id": "productName"}).text
+            new_dict['quoteDelay'] = exp_json['quoteDelay']
+            new_dict['tradeDate'] = exp_json['tradeDate']
+            cme_list.append(new_dict)
+    cme_df = pd.DataFrame(cme_list)
+
+    # Export DF to load
+    cme_df.to_csv(os.path.join(DIR_PATH, '_Input', KDS_ID+'.csv'), sep='\t', header=False, index=False)
+    return tuple(cme_df.columns)
+
+# Load into database
+def load_data(DIR_PATH, KDS_ID, columns_tup):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    conn = pg_db.get_conn()
+
+    # Wait for the CME Output from dataframe
+    while not os.path.exists(os.path.join(DIR_PATH, '_Input', KDS_ID+'.csv')):
+        time.sleep(1)
+    
+    if os.path.exists(os.path.join(DIR_PATH, '_Input', KDS_ID+'.csv')):
+        os.chmod(os.path.join(DIR_PATH, '_Input', KDS_ID+'.csv'), 0o777)
+
+    with open(os.path.join(DIR_PATH, '_Input', KDS_ID+'.csv'), 'r') as f:
+        cur = conn.cursor()
+        cur.copy_from(f, 'dat.cme', sep="\t", columns=eval(columns_tup))
+        conn.commit()
+        cur.close()
+    return
+
+def export_data(DIR_PATH, KDS_ID):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    conn = pg_db.get_conn()
+    conn_cursor = conn.cursor()
+    
+    query = "SELECT * FROM dat.cme"
+    outputquery = "COPY ({0}) TO STDOUT WITH CSV HEADER".format(query)
+
+    with open(os.path.join(DIR_PATH, '_Output', KDS_ID + '.csv'), 'w') as f:
+        conn_cursor.copy_expert(outputquery, f)
+
+    conn_cursor.close()
+    conn.close()
+    return
+
+
+def bs_extract(DIR_PATH, url):
+    chrome_options = Options()
+    browser = webdriver.Remote(Variable.get("selenium_hub"), chrome_options.to_capabilities())
+    browser.get(url)
+
+    # wait for element to appear, then hover it
+    wait = WebDriverWait(browser, 20)
+    notFound = True
+    count = 0
+    while notFound:
+        try:
+            xpath = '//*[@id="optionQuotesProductTable1"]'
+            time.sleep(3)
+            body_wait = wait.until(ec.visibility_of_element_located((By.XPATH, xpath)))
+            notFound = False
+            html = browser.page_source
+            browser.quit()
+            return BeautifulSoup(html, "lxml")
+        except Exception as e:
+            print (e)
+            browser.refresh()
+            count = count + 1
+            print ('looping to check element exists :' + str(count))
+            if count > 30:
+                notFound = False
+                print ('Element not found after 30 occurences..Exit from loop!!!')
+                browser.quit()
+                return
+
+def clear_folders(DIR_PATH, FOLDER_NAME, FILE_NAME):
+    try:
+        os.remove(os.path.join(DIR_PATH, FOLDER_NAME, FILE_NAME))
+        return "Success"
+    except ValueError:
+        raise ValueError("Unable to remove the input file")
+
+def push_to_aws(kds_id):
+    s3_hook = S3Hook(aws_conn_id='s3_conn')
+    s3_hook.get_conn()
+    local_path = os.path.join(DIR_PATH, '_Output', kds_id+'.csv')
+    s3_hook.load_file(filename=local_path, key=kds_id+'.csv', bucket_name=Variable.get("s3_datasets_bucket_name"), replace=True)
+    return "Sucess: Pushed the output"
+
+def get_dataset_uid(dataset_id):
+    try:
+        res = requests.get(Variable.get("kds_api_url") + "catalog/datasets/" + dataset_id, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res.json()['dataset']['dataset_uid']
+    except ValueError:
+        raise ValueError("Error: While getting the dataset uid")
+
+def update_dataset_metadata(uid, template, metadata_name, attribute, value):
+    payload = '{"value": "'+value+'" , "override_remote_value": true}'
+    try:
+        res = requests.put(Variable.get("kds_api_management_url") + '/' + uid + '/' + template + '/' + metadata_name + '/' + attribute, data=payload, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res
+    except ValueError:
+        raise ValueError("Error while updating metadata on KDS")
+
+def publish(dataset_id):
+    dataset_uid = get_dataset_uid(dataset_id)
+    update_metadata = update_dataset_metadata(dataset_uid, 'metadata', 'custom', 'last-checked-date', datetime.datetime.now().strftime("%Y-%m-%d"))
+    if update_metadata.status_code == 200:
+        try:
+            response = requests.put(Variable.get("kds_api_management_url") + '/' + dataset_uid + '/publish/', auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+            return response.json()
+        except ValueError:
+            raise ValueError("Error while publishing the dataset_uid")
+
+default_args = {
+    'owner': 'Anup Kumar',
+    'depends_on_past': False,
+    'start_date': airflow.utils.dates.days_ago(1),
+    'email': [Variable.get("alert_email_to")],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': datetime.timedelta(minutes=10)
+}
+
+dag = DAG(
+    'CME',
+    default_args=default_args,
+    description='Chicago Mercantile Exchange & Chicago Board of Trade - CME Group Inc',
+    schedule_interval='0 3 * * 3',
+)
+
+start_task = DummyOperator(task_id="Start", dag=dag)
+end_task = DummyOperator(task_id="End", dag=dag)
+
+data_extraction = PythonOperator(
+                    task_id = 'data_extraction',
+                    python_callable=extract_data,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'KDS_ID': KDS_ID, 'CME_URL': CME_URL},
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+load_data_file = PythonOperator(
+                    task_id = 'load_data_file',
+                    python_callable=load_data,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'KDS_ID': KDS_ID, 'columns_tup': "{{ task_instance.xcom_pull(task_ids='data_extraction', key='return_value') }}"},
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+export_dataset = PythonOperator(
+                    task_id = 'export_data',
+                    python_callable=export_data,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'KDS_ID': KDS_ID},
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+load_dataset_to_aws = PythonOperator(
+                    task_id="push_to_aws", 
+                    python_callable=push_to_aws,
+                    op_kwargs={'kds_id': KDS_ID},
+                    dag=dag
+                )
+
+publish_dataset = PythonOperator(
+                task_id="PublishDataset", 
+                python_callable=publish,
+                op_kwargs={'dataset_id': KDS_ID},
+                dag=dag
+            )
+
+clear_input = PythonOperator(
+                task_id="ClearInput", 
+                python_callable=clear_folders,
+                op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Input', 'FILE_NAME': KDS_ID+'.csv'},
+                dag=dag
+            )
+
+clear_output = PythonOperator(
+                task_id="ClearOutput", 
+                python_callable=clear_folders,
+                op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Output', 'FILE_NAME': KDS_ID+'.csv'},
+                dag=dag
+            )
+
+start_task >> data_extraction >> load_data_file >> export_dataset >> load_dataset_to_aws >> publish_dataset >> clear_input >> clear_output >> end_task

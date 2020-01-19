@@ -1,0 +1,404 @@
+# coding: utf-8
+#-------------------------------------- Chnage Log -------------------------------------------
+__author__ = "Anup Kumar"
+__copyright__ = "Copyright 2019, KAPSARC EIM Project"
+__credits__ = ["Anup Kumar"]
+__license__ = "Prop"
+__version__ = "1.0.0"
+__maintainer__ = "Anup Kumar"
+__email__ = "anup.kumar@kapsarc.org"
+__status__ = "Production"
+#------------------------------------ Change Details ------------------------------------------
+# 05/14/2019 - Anup Kumar - Initial code to get the data from NOAA for saudi stations
+# 07/30/2019 - Anup Kumar - Migration to airflow, added the publishing dataset functionality along with last checked date
+# 08/07/2019 - Anup Kumar - Fixed bugs
+# 09/10/2019 - Anup Kumar - Updated the FTP to AWS
+#----------------------------------------------------------------------------------------------
+
+import os, requests, time, csv, datetime
+from requests.auth import HTTPBasicAuth
+import pandas as pd
+import airflow
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.hooks.postgres_hook import PostgresHook
+from airflow.hooks.S3_hook import S3Hook
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+WIND_DIRECTION_QUALITY_MAPPING = {
+    '0': 'Passed gross limits check', '1': 'Passed all quality control checks', '2': 'Suspect', 
+    '3': 'Erroneous', '4': 'Passed gross limits check, data originate from an NCEI data source', 
+    '5': 'Passed all quality control checks, data originate from an NCEI data source', '6': 'Suspect, data originate from an NCEI data source',
+    '7': 'Erroneous, data originate from an NCEI data source', '9': 'Passed gross limits check if element is present'
+}
+
+WIND_TYPE_MAPPING = {
+    'A': 'Abridged Beaufort', 'B': 'Beaufort', 'C': 'Calm', 'H': '5-Minute Average Speed', 'N': 'Normal', 'R': '60-Minute Average Speed', 
+    'Q': 'Squall', 'T': '180 Minute Average Speed', 'V': 'Variable', '9': 'Missing'
+}
+
+WIND_SPEED_QUALITY_MAPPING = {
+    '0': 'Passed gross limits check', '1': 'Passed all quality control checks', '2': 'Suspect', 
+    '3': 'Erroneous', '4': 'Passed gross limits check, data originate from an NCEI data source', 
+    '5': 'Passed all quality control checks, data originate from an NCEI data source', '6': 'Suspect, data originate from an NCEI data source',
+    '7': 'Erroneous, data originate from an NCEI data source', '9': 'Passed gross limits check if element is present'
+}
+
+SKY_CEILING_QUALITY_MAPPING = {
+    '0': 'Passed gross limits check', '1': 'Passed all quality control checks', '2': 'Suspect', 
+    '3': 'Erroneous', '4': 'Passed gross limits check, data originate from an NCEI data source', 
+    '5': 'Passed all quality control checks, data originate from an NCEI data source', '6': 'Suspect, data originate from an NCEI data source',
+    '7': 'Erroneous, data originate from an NCEI data source', '9': 'Passed gross limits check if element is present'
+}
+
+SKY_CEILING_DETERMINATION_MAPPING = {
+    'A': 'Aircraft', 'B': 'Balloon', 'C': 'Statistically derived', 'D': 'Persistent cirriform ceiling (pre-1950 data)', 
+    'E': 'Estimated', 'M': 'Measured', 'P': 'Precipitation ceiling (pre-1950 data)', 'R': 'Radar', 'S': 'ASOS augmented', 
+    'U': 'Unknown ceiling (pre-1950 data)', 'V': 'Variable ceiling (pre-1950 data)', 'W': 'Obscured', '9': 'Missing'
+}
+
+SKY_CAVOK_MAPPING = {
+    'N': 'No', 'Y': 'Yes', '9': 'Missing'
+}
+
+VISIBILITY_DISTANCE_QUALITY = {
+    '0': 'Passed gross limits check', '1': 'Passed all quality control checks', '2': 'Suspect', 
+    '3': 'Erroneous', '4': 'Passed gross limits check, data originate from an NCEI data source', 
+    '5': 'Passed all quality control checks, data originate from an NCEI data source', '6': 'Suspect, data originate from an NCEI data source',
+    '7': 'Erroneous, data originate from an NCEI data source', '9': 'Passed gross limits check if element is present'
+}
+
+VISIBILITY_VARIABILITY_MAPPING = {
+    'N': 'Not variable', 'V': 'Variable', '9': 'Missing'
+}
+
+VISIBILITY_VARIABILITY_QUALITY_MAPPING = {
+    '0': 'Passed gross limits check', '1': 'Passed all quality control checks', '2': 'Suspect', 
+    '3': 'Erroneous', '4': 'Passed gross limits check, data originate from an NCEI data source', 
+    '5': 'Passed all quality control checks, data originate from an NCEI data source', '6': 'Suspect, data originate from an NCEI data source',
+    '7': 'Erroneous, data originate from an NCEI data source', '9': 'Passed gross limits check if element is present'
+}
+
+AIR_TEMPERATURE_QUALITY_MAPPING = {
+    '0': 'Passed gross limits check', '1': 'Passed all quality control checks', '2': 'Suspect', 
+    '3': 'Erroneous', '4': 'Passed gross limits check, data originate from an NCEI data source', 
+    '5': 'Passed all quality control checks, data originate from an NCEI data source', '6': 'Suspect, data originate from an NCEI data source',
+    '7': 'Erroneous, data originate from an NCEI data source', '9': 'Passed gross limits check if element is present',
+    'A': 'Data value flagged as suspect, but accepted as a good value', 
+    'C': 'Temperature and dew point received from Automated Weather Observing System (AWOS) are reported in whole degrees Celsius. Automated QC flags these values, but they are accepted as valid.', 
+    'I': 'Data value not originally in data, but inserted by validator', 'M': 'Manual changes made to value based on information provided by NWS or FAA', 
+    'P': 'Data value not originally flagged as suspect, but replaced by validator', 'R': 'Data value replaced with value computed by NCEI software', 
+    'U': 'Data value replaced with edited value'
+}
+
+AIR_TEMPERATURE_DEW_POINT_QUALITY_MAPPING = {
+    '0': 'Passed gross limits check', '1': 'Passed all quality control checks', '2': 'Suspect', 
+    '3': 'Erroneous', '4': 'Passed gross limits check, data originate from an NCEI data source', 
+    '5': 'Passed all quality control checks, data originate from an NCEI data source', '6': 'Suspect, data originate from an NCEI data source',
+    '7': 'Erroneous, data originate from an NCEI data source', '9': 'Passed gross limits check if element is present',
+    'A': 'Data value flagged as suspect, but accepted as a good value', 
+    'C': 'Temperature and dew point received from Automated Weather Observing System (AWOS) are reported in whole degrees Celsius. Automated QC flags these values, but they are accepted as valid.', 
+    'I': 'Data value not originally in data, but inserted by validator', 'M': 'Manual changes made to value based on information provided by NWS or FAA', 
+    'P': 'Data value not originally flagged as suspect, but replaced by validator', 'R': 'Data value replaced with value computed by NCEI software', 
+    'U': 'Data value replaced with edited value'
+}
+
+ATMOSPHERIC_SEA_LEVEL_PRESSURE_QUALITY_MAPPING = {
+    '0': 'Passed gross limits check', '1': 'Passed all quality control checks', '2': 'Suspect', 
+    '3': 'Erroneous', '4': 'Passed gross limits check, data originate from an NCEI data source', 
+    '5': 'Passed all quality control checks, data originate from an NCEI data source', '6': 'Suspect, data originate from an NCEI data source',
+    '7': 'Erroneous, data originate from an NCEI data source', '9': 'Passed gross limits check if element is present'
+}
+DIR_PATH = os.path.abspath(os.path.dirname(__file__))
+KDS_MAPI_URL = 'https://datasource.kapsarc.org/api/management/v2/datasets'
+NOAA_HOURLY_URL = 'https://www.ncei.noaa.gov/data/global-hourly/access/'
+KDS_ID  = 'saudi-hourly-weather-data'
+
+def main(station):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    conn = pg_db.get_conn()
+    start_year = 1901 if station['last_year'] == None else station['last_year']
+    for each_year in range(int(datetime.date.today().year), int(datetime.date.today().year)+1):
+        try:
+            datum_df = pd.read_csv(NOAA_HOURLY_URL + str(each_year) + '/' +  str(int(station['station_id'])) + '.csv')
+        except Exception as e:
+            print (e)
+            print ("Error with the link ", NOAA_HOURLY_URL + str(each_year) + '/' +  str(int(station['station_id'])) + '.csv')
+            return
+
+        datum_df['DATE'] = pd.to_datetime(datum_df['DATE'], format='%Y-%m-%dT%H:%M:%S')
+        datum_df.rename(columns={"DATE": "observation_date", "STATION": "station_id", "SOURCE": "source_id", "LATITUDE": 'latitude', "LONGITUDE": 'longitude', "ELEVATION": 'elevation'}, inplace=True)
+        datum_df['station_name'] = station['station']
+        datum_df['station_country'] = station['country']
+        del datum_df['NAME']
+
+        # Processing dataframe
+        datum_df = process_dataframe(datum_df)
+
+        # Get Max Observation date
+        max_obs_date  = get_max_obs_date(station['station_id'])[0]['max_obs_date']
+        
+        # Filter the max_date
+        datum_df = datum_df[datum_df.observation_date>max_obs_date]
+
+        if not datum_df.empty:
+            # Adding the load timestamps
+            datum_df['last_load_date'] = datetime.datetime.utcnow()
+
+            # Exporting to CSV for bulk loading
+            datum_df.to_csv(os.path.join(DIR_PATH, '_Output', 'noaa_bulk_upsert_'+ str(int(station['station_id'])) +'.csv'), sep='\t', header=False, index=False)
+
+            # Bulk Inserting
+            noaa_station_output_file = os.path.join(DIR_PATH, '_Output', 'noaa_bulk_upsert_'+ str(int(station['station_id'])) +'.csv')
+            
+            # # Wait for the noaa_station_output_file
+            while not os.path.exists(noaa_station_output_file):
+                time.sleep(1)
+            
+            if os.path.exists(noaa_station_output_file):
+                os.chmod(noaa_station_output_file, 0o777)
+
+            with open(noaa_station_output_file, 'r') as f:
+                copy_sql = """
+                            COPY dat.noaa FROM STDIN WITH (FORMAT CSV, DELIMITER '\t',
+                            HEADER TRUE)
+                           """
+                cur = conn.cursor()
+                cur.copy_from(f, 'dat.noaa', sep="\t", columns=tuple(datum_df.columns))
+                conn.commit()
+                cur.close()
+
+        # Update the db
+        update_last_year(station['station_id'], each_year)
+
+    conn.close()
+
+    return
+
+def process_dataframe(df):
+    df[['wind_direction_angle', 'wind_direction_quality', 'wind_type', 'wind_speed_rate', 'wind_speed_quality']] = df.WND.str.split(',', expand = True)
+    df[['sky_ceiling_height', 'sky_ceiling_quality', 'sky_ceiling_determination', 'sky_cavok']] = df.CIG.str.split(',', expand = True)
+    df[['visibility_distance', 'visibility_distance_quality', 'visibility_variability', 'visibility_variability_quality']] = df.VIS.str.split(',', expand = True)
+    df[['air_temperature', 'air_temperature_quality']] = df.TMP.str.split(',', expand = True)
+    df[['air_temperature_dew_point', 'air_temperature_dew_point_quality']] = df.DEW.str.split(',', expand = True)
+    df[['atmospheric_sea_level_pressure', 'atmospheric_sea_level_pressure_quality']] = df.SLP.str.split(',', expand = True)
+    df = df[['station_id', 'source_id', 'station_name', 'station_country', 'observation_date','latitude', 'longitude', 'elevation', 
+                'wind_direction_angle', 'wind_direction_quality', 'wind_type', 'wind_speed_rate', 'wind_speed_quality', 
+                'sky_ceiling_height', 'sky_ceiling_quality', 'sky_ceiling_determination', 'sky_cavok',
+                'visibility_distance', 'visibility_distance_quality', 'visibility_variability', 'visibility_variability_quality',
+                'air_temperature', 'air_temperature_quality',
+                'air_temperature_dew_point', 'air_temperature_dew_point_quality',
+                'atmospheric_sea_level_pressure', 'atmospheric_sea_level_pressure_quality']]
+    
+    df['wind_direction_quality'] = df['wind_direction_quality'].map(WIND_DIRECTION_QUALITY_MAPPING)
+    df['wind_type'] = df['wind_type'].map(WIND_TYPE_MAPPING)
+    df['wind_speed_quality'] = df['wind_speed_quality'].map(WIND_SPEED_QUALITY_MAPPING)
+    df['sky_ceiling_quality'] = df['sky_ceiling_quality'].map(SKY_CEILING_QUALITY_MAPPING)
+    df['sky_ceiling_determination'] = df['sky_ceiling_determination'].map(SKY_CEILING_DETERMINATION_MAPPING)
+    df['sky_cavok'] = df['sky_cavok'].map(SKY_CAVOK_MAPPING)
+    df['visibility_distance_quality'] = df['visibility_distance_quality'].map(VISIBILITY_DISTANCE_QUALITY)
+    df['visibility_variability'] = df['visibility_variability'].map(VISIBILITY_VARIABILITY_MAPPING)
+    df['visibility_variability_quality'] = df['visibility_variability_quality'].map(VISIBILITY_VARIABILITY_QUALITY_MAPPING)
+    df['air_temperature_quality'] = df['air_temperature_quality'].map(AIR_TEMPERATURE_QUALITY_MAPPING)
+    df['air_temperature_dew_point_quality'] = df['air_temperature_dew_point_quality'].map(AIR_TEMPERATURE_DEW_POINT_QUALITY_MAPPING)
+    df['atmospheric_sea_level_pressure_quality'] = df['atmospheric_sea_level_pressure_quality'].map(ATMOSPHERIC_SEA_LEVEL_PRESSURE_QUALITY_MAPPING)
+
+    # UNITS
+    df['wind_direction_angle_units'] = 'ANGULAR DEGREES'
+    df['wind_speed_rate_units'] = 'METERS PER SECOND'
+    df['sky_ceiling_height_units'] = 'METERS'
+    df['visibility_distance_units'] = 'METERS'
+    df['air_temperature_units'] = 'DEGREES CELSIUS'
+    df['air_temperature_dew_point_units'] = 'DEGREES CELSIUS'
+    df['atmospheric_sea_level_pressure_units'] = 'HECTOPASCALS'
+
+    # SCALING FACTORS
+    df['wind_speed_rate'] = df['wind_speed_rate'].str.replace('−', '-').astype(float).div(10).round(2)
+    df['air_temperature'] = df['air_temperature'].str.replace('−', '-').astype(float).div(10).round(2)
+    df['air_temperature_dew_point'] = df['air_temperature_dew_point'].str.replace('−', '-').astype(float).div(10).round(2)
+    df['atmospheric_sea_level_pressure'] = df['atmospheric_sea_level_pressure'].str.replace('−', '-').astype(float).div(10).round(2)
+    
+    # Conversions
+    df['wind_direction_angle'] = df['wind_direction_angle'].str.replace('−', '-').astype(float)
+    df['sky_ceiling_height'] = df['sky_ceiling_height'].str.replace('−', '-').astype(float)
+    df['visibility_distance'] = df['visibility_distance'].str.replace('−', '-').astype(float)
+
+    return df
+
+def export_5year_data(DIR_PATH, KDS_ID):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    conn = pg_db.get_conn()
+    conn_cursor = conn.cursor()
+
+    query = "SELECT * FROM dat.noaa WHERE extract(year from observation_date) BETWEEN {} AND {}".format((int(datetime.date.today().year)-5), int(datetime.date.today().year))
+    outputquery = "COPY ({0}) TO STDOUT WITH CSV HEADER".format(query)
+
+    with open(os.path.join(DIR_PATH, '_Output', KDS_ID + '.csv'), 'w') as f:
+        conn_cursor.copy_expert(outputquery, f)
+    
+    conn_cursor.close()
+    conn.close()
+    return
+
+def get_dataset_uid(dataset_id):
+    try:
+        res = requests.get(Variable.get("kds_api_url") + "catalog/datasets/" + dataset_id, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res.json()['dataset']['dataset_uid']
+    except ValueError:
+        raise ValueError("Error: While getting the dataset uid")
+
+def update_dataset_metadata(uid, template, metadata_name, attribute, value):
+    payload = '{"value": "'+value+'" , "override_remote_value": true}'
+    try:
+        res = requests.put(Variable.get("kds_api_management_url") + '/' + uid + '/' + template + '/' + metadata_name + '/' + attribute, data=payload, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res
+    except ValueError:
+        raise ValueError("Error while updating metadata on KDS")
+
+def publish(dataset_id):
+    dataset_uid = get_dataset_uid(dataset_id)
+    update_metadata = update_dataset_metadata(dataset_uid, 'metadata', 'custom', 'last-checked-date', datetime.datetime.now().strftime("%Y-%m-%d"))
+    if update_metadata.status_code == 200:
+        try:
+            response = requests.put(Variable.get("kds_api_management_url") + '/' + dataset_uid + '/publish/', auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+            return response.json()
+        except ValueError:
+            raise ValueError("Error while publishing the dataset_uid")
+
+def get_max_obs_date(station_id):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute('SELECT max(observation_date) as MAX_OBS_DATE FROM dat.noaa where station_id = {}'.format(int(station_id)))
+    columns = [column[0] for column in src_cursor.description]
+    max_obs_date_list = [dict(zip(columns, row)) for row in src_cursor.fetchall()]
+    src_cursor.close()
+    src_conn.close()
+    return max_obs_date_list
+
+def update_last_year(station_id, year_val):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("UPDATE lkp.noaa_stations SET last_year = {} WHERE station_id = {}".format(int(year_val), int(station_id)))
+    src_conn.commit()
+    src_cursor.close()
+    src_conn.close()
+    return
+
+def get_stations_list():
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute('SELECT station_id, station, elevation, latitude, longitude, last_year, country FROM lkp.noaa_stations')
+    columns = [column[0] for column in src_cursor.description]
+    stations_list = [dict(zip(columns, row)) for row in src_cursor.fetchall()]
+    src_cursor.close()
+    src_conn.close()
+    return stations_list
+
+def clear_folders(DIR_PATH, FOLDER_NAME, FILE_NAME):
+    if os.path.exists(os.path.join(DIR_PATH, FOLDER_NAME, FILE_NAME)):
+        try:
+            os.remove(os.path.join(DIR_PATH, FOLDER_NAME, FILE_NAME))
+            return "Success"
+        except ValueError:
+            raise ValueError("Unable to remove the input file")
+    else:
+        return
+
+def push_to_aws(kds_id):
+    s3_hook = S3Hook(aws_conn_id='s3_conn')
+    s3_hook.get_conn()
+    local_path = os.path.join(DIR_PATH, '_Output', kds_id+'.csv')
+    s3_hook.load_file(filename=local_path, key=kds_id+'.csv', bucket_name=Variable.get("s3_datasets_bucket_name"), replace=True)
+    return "Sucess: Pushed the output"
+
+def each_id_dag(DIR_PATH, station_details, main_dag_id, start_date, schedule_interval):
+    dag = DAG(
+    '%s.%s' % (main_dag_id, str(int(float(station_details['station_id'])))),
+    schedule_interval=schedule_interval,
+    start_date=start_date,
+    )
+
+    process_dataset = PythonOperator(
+        task_id = 'process_station_data',
+        python_callable=main,
+        op_kwargs={'station': station_details},
+        start_date=airflow.utils.dates.days_ago(0),
+        dag=dag
+    )
+
+    clear_outputs = PythonOperator(
+                    task_id="ClearStationOutput", 
+                    python_callable=clear_folders,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Output', 'FILE_NAME': 'noaa_bulk_upsert_'+str(int(station_details['station_id']))+'.csv'},
+                    dag=dag
+                )
+
+    process_dataset >> clear_outputs
+    return dag
+
+default_args = {
+    'owner': 'Anup Kumar',
+    'depends_on_past': False,
+    'start_date': airflow.utils.dates.days_ago(1),
+    'email': [Variable.get("alert_email_to")],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': datetime.timedelta(minutes=10)
+}
+
+main_dag = DAG(
+    'NOAA',
+    default_args=default_args,
+    description='Saudi hourly weather data from NOAA',
+    schedule_interval='5 7 * * *',
+)
+
+start_task = DummyOperator(task_id="Start", dag=main_dag)
+end_task = DummyOperator(task_id="End", dag=main_dag)
+
+export_5year_data_task = PythonOperator(
+                            task_id="ExportLast5Year", 
+                            python_callable=export_5year_data,
+                            op_kwargs={'DIR_PATH': DIR_PATH, 'KDS_ID': KDS_ID},
+                            dag=main_dag
+                        )
+
+load_dataset_to_aws = PythonOperator(
+                    task_id="push_to_aws", 
+                    python_callable=push_to_aws,
+                    op_kwargs={'kds_id': KDS_ID},
+                    dag=main_dag
+                )
+
+publish_dataset = PythonOperator(
+                task_id="PublishDataset", 
+                python_callable=publish,
+                op_kwargs={'dataset_id': KDS_ID},
+                dag=main_dag
+            )
+
+clean_outputs = PythonOperator(
+                            task_id="CleanOutputs", 
+                            python_callable=clear_folders,
+                            op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Output', 'FILE_NAME': KDS_ID + '.csv'},
+                            dag=main_dag
+                        )
+
+stations_list = get_stations_list()
+for station in stations_list:
+    sub_dag = SubDagOperator(
+            subdag=each_id_dag(DIR_PATH, station, 'NOAA', main_dag.default_args['start_date'], main_dag.schedule_interval),
+            task_id=str(int(float(station['station_id']))),
+            dag=main_dag,
+        )
+
+    start_task >> sub_dag >> export_5year_data_task >> load_dataset_to_aws >> publish_dataset >> clean_outputs >> end_task

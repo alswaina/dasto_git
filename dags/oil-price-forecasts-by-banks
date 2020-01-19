@@ -1,0 +1,262 @@
+#-------------------------------------- Chnage Log -------------------------------------------
+__author__ = "Anup Kumar"
+__copyright__ = "Copyright 2019, KAPSARC EIM Project"
+__credits__ = ["Anup Kumar"]
+__license__ = "Prop"
+__version__ = "1.0.0"
+__maintainer__ = "Anup Kumar"
+__email__ = "anup.kumar@kapsarc.org"
+__status__ = "Production"
+#------------------------------------ Change Details ------------------------------------------
+# 08/01/2019 - Dana Al Henki - Initial code
+# 09/02/2019 - Anup Kumar - Cleased the code and migrated to airflow
+# 09/10/2019 - Anup Kumar - Updated the FTP to AWS
+#----------------------------------------------------------------------------------------------
+
+import os, requests, time, csv, datetime, json, sys, platform
+from requests.auth import HTTPBasicAuth
+from bs4 import BeautifulSoup
+import pandas as pd
+import airflow
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.hooks.postgres_hook import PostgresHook
+from airflow.hooks.S3_hook import S3Hook
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+DIR_PATH = os.path.abspath(os.path.dirname(__file__))
+INVESTING_URL = 'https://www.investing.com/commodities/brent-oil-forecasts'
+KDS_ID = 'oil-price-forecasts-by-banks'
+
+def extract_data(DIR_PATH, KDS_ID, INVESTING_URL):
+    headers = {
+            'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/56.0.2924.87 Safari/537.36',
+            'referrer': 'https://www.investing.com/commodities/',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Pragma': 'no-cache',
+        }
+    
+    try:
+        res = requests.get(INVESTING_URL, headers=headers)
+    except requests.exceptions.Timeout:
+        return "Error: Timeout"
+    except requests.exceptions.TooManyRedirects:
+        return "Error: Too many redirects"
+    except requests.exceptions.RequestException as e:
+        return "Error: " + str(e)
+    
+    soup = BeautifulSoup(res.content, 'lxml')
+    
+    # Table with class name
+    table = soup.find_all('table', {"class" : "genTbl closedTbl forecastTbl"})
+
+    # Rows of second table in the url
+    rows = table[1].select('tbody > tr')
+
+    # Headers
+    headers = [th.text.rstrip() for th in table[1].select('thead > tr')[0].find_all('th')]
+
+    data_list = []
+    for row in rows[1:]:
+        data = [th.text.rstrip() for th in row.find_all('td')]
+        data_list.append(dict(zip(headers, data)))
+    
+    df = pd.DataFrame(data_list)
+    df = df.set_index('Analysts').stack().reset_index()
+
+    # Splitting year, quarter columns into respective one from "Level_1" and adding frequency
+    year_list = []
+    quarter_list = []
+    freq_list = []
+
+    for val in df['level_1'].values:
+        # If val is Q => Quarter
+        if 'Q' in val:
+            quarter_list.append(val.split(" ")[0])
+            year_list.append(datetime.datetime.now().strftime("%Y")[0:2] + val.split(" ")[1])
+            freq_list.append('Quarterly')
+        # Annual
+        else:
+            quarter_list.append('')
+            year_list.append(val)
+            freq_list.append('Annualy')
+
+    # Adding the columns
+    df['year'] = year_list
+    df['quarter'] = quarter_list
+    df['reporting_frequency'] = freq_list
+    df['last_extracted_timestamp'] = datetime.datetime.utcnow()
+    df['last_load_timestamp'] = datetime.datetime.utcnow()
+
+    # Renaming the Analysts & Value column and adding unit of mesaure
+    df=df.rename(columns = {0:'value', 'Analysts':'analysts'})
+    df['unit_of_measure'] = 'USD'
+
+    # Using the to_numeric method in order to convert the values under the value column into a float:
+    df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0)
+
+    # dropping Level_1 column
+    del df['level_1']
+
+    # Rearranging the columns
+    df = df[['analysts', 'year', 'quarter', 'reporting_frequency', 'value', 'unit_of_measure', 'last_extracted_timestamp', 'last_load_timestamp']]
+
+    # Export the dataset as Input
+    df.to_csv (os.path.join(DIR_PATH, '_Input', KDS_ID+'.csv'), sep='\t', index = False, header=False)
+
+    return tuple(df.columns)
+
+def load_data(DIR_PATH, KDS_ID, columns_tup):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    conn = pg_db.get_conn()
+
+    # # Wait for the input file
+    while not os.path.exists(os.path.join(DIR_PATH, '_Input', KDS_ID+'.csv')):
+        time.sleep(1)
+    
+    if os.path.exists(os.path.join(DIR_PATH, '_Input', KDS_ID+'.csv')):
+        os.chmod(os.path.join(DIR_PATH, '_Input', KDS_ID+'.csv'), 0o777)
+    
+    with open(os.path.join(DIR_PATH, '_Input', KDS_ID+'.csv'), 'r') as f:
+        cur = conn.cursor()
+        cur.copy_from(f, 'dat.banks_oil_forecast', sep="\t", columns=eval(columns_tup))
+        conn.commit()
+        cur.close()
+    return
+
+def export_data(DIR_PATH, KDS_ID):
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    conn = pg_db.get_conn()
+    conn_cursor = conn.cursor()
+    
+    query = "SELECT * FROM dat.banks_oil_forecast"
+    outputquery = "COPY ({0}) TO STDOUT WITH CSV HEADER".format(query)
+
+    with open(os.path.join(DIR_PATH, '_Output', KDS_ID + '.csv'), 'w') as f:
+        conn_cursor.copy_expert(outputquery, f)
+
+    conn_cursor.close()
+    conn.close()
+    return
+
+def clear_folders(DIR_PATH, FOLDER_NAME, FILE_NAME):
+    try:
+        os.remove(os.path.join(DIR_PATH, FOLDER_NAME, FILE_NAME))
+        return "Success"
+    except ValueError:
+        raise ValueError("Unable to remove the input file")
+
+def push_to_aws(kds_id):
+    s3_hook = S3Hook(aws_conn_id='s3_conn')
+    s3_hook.get_conn()
+    local_path = os.path.join(DIR_PATH, '_Output', kds_id+'.csv')
+    s3_hook.load_file(filename=local_path, key=kds_id+'.csv', bucket_name=Variable.get("s3_datasets_bucket_name"), replace=True)
+    return "Sucess: Pushed the output"
+
+def get_dataset_uid(dataset_id):
+    try:
+        res = requests.get(Variable.get("kds_api_url") + "catalog/datasets/" + dataset_id, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res.json()['dataset']['dataset_uid']
+    except ValueError:
+        raise ValueError("Error: While getting the dataset uid")
+
+def update_dataset_metadata(uid, template, metadata_name, attribute, value):
+    payload = '{"value": "'+value+'" , "override_remote_value": true}'
+    try:
+        res = requests.put(Variable.get("kds_api_management_url") + '/' + uid + '/' + template + '/' + metadata_name + '/' + attribute, data=payload, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res
+    except ValueError:
+        raise ValueError("Error while updating metadata on KDS")
+
+def publish(dataset_id):
+    dataset_uid = get_dataset_uid(dataset_id)
+    update_metadata = update_dataset_metadata(dataset_uid, 'metadata', 'custom', 'last-checked-date', datetime.datetime.now().strftime("%Y-%m-%d"))
+    if update_metadata.status_code == 200:
+        try:
+            response = requests.put(Variable.get("kds_api_management_url") + '/' + dataset_uid + '/publish/', auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+            return response.json()
+        except ValueError:
+            raise ValueError("Error while publishing the dataset_uid")
+
+default_args = {
+    'owner': 'Anup Kumar',
+    'depends_on_past': False,
+    'start_date': airflow.utils.dates.days_ago(1),
+    'email': [Variable.get("alert_email_to")],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': datetime.timedelta(minutes=10)
+}
+
+dag = DAG(
+    'oil-price-forecasts-by-banks',
+    default_args=default_args,
+    description='Banks oil price forecast - Investing.com ==> https://www.investing.com/commodities/brent-oil-forecasts',
+    schedule_interval='30 14 20 * *',
+)
+
+start_task = DummyOperator(task_id="Start", dag=dag)
+end_task = DummyOperator(task_id="End", dag=dag)
+
+data_extraction = PythonOperator(
+                    task_id = 'data_extraction',
+                    python_callable=extract_data,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'KDS_ID': KDS_ID, 'INVESTING_URL': INVESTING_URL},
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+load_data_file = PythonOperator(
+                    task_id = 'load_data_file',
+                    python_callable=load_data,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'KDS_ID': KDS_ID, 'columns_tup': "{{ task_instance.xcom_pull(task_ids='data_extraction', key='return_value') }}"},
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+export_dataset = PythonOperator(
+                    task_id = 'export_data',
+                    python_callable=export_data,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'KDS_ID': KDS_ID},
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+load_dataset_to_aws = PythonOperator(
+                    task_id="push_to_aws", 
+                    python_callable=push_to_aws,
+                    op_kwargs={'kds_id': KDS_ID},
+                    dag=dag
+                )
+
+publish_dataset = PythonOperator(
+                task_id="PublishDataset", 
+                python_callable=publish,
+                op_kwargs={'dataset_id': KDS_ID},
+                dag=dag
+            )
+
+clear_input = PythonOperator(
+                task_id="ClearInput", 
+                python_callable=clear_folders,
+                op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Input', 'FILE_NAME': KDS_ID+'.csv'},
+                dag=dag
+            )
+
+clear_output = PythonOperator(
+                task_id="ClearOutput", 
+                python_callable=clear_folders,
+                op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Output', 'FILE_NAME': KDS_ID+'.csv'},
+                dag=dag
+            )
+
+start_task >> data_extraction >> load_data_file >> export_dataset >> load_dataset_to_aws >> publish_dataset >> clear_input >> clear_output >> end_task
+

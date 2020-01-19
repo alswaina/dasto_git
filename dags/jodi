@@ -1,0 +1,239 @@
+#-------------------------------------- Chnage Log -------------------------------------------
+__author__ = "Anup Kumar"
+__copyright__ = "Copyright 2018, KAPSARC EIM Project"
+__credits__ = ["Anup Kumar"]
+__license__ = "Prop"
+__version__ = "1.0.0"
+__maintainer__ = "Anup Kumar"
+__email__ = "anup.kumar@kapsarc.org"
+__status__ = "Production"
+#------------------------------------ Change Details ------------------------------------------
+# 12/27/2017 - Anup Kumar - Downloading the JODI datasets
+# 07/26/2017 - Sadeem Al Hosain - Data Processing for the datasets downloaded
+# 04/17/2019 - Anup Kumar - Fixed the HTTP proxy issue
+# 08/29/2019 - Anup Kumar - Migration to Airflow
+# 09/09/2019 - Anup Kumar - Fixed the ALPHA_3_CODE and NUMERIC missing fields
+# 09/10/2019 - Anup Kumar - Updated the FTP to AWS
+#----------------------------------------------------------------------------------------------
+
+import os, requests, time, csv, datetime, zipfile, json, calendar
+from urllib.request import urlopen, urlretrieve
+from urllib.parse import urlparse, urljoin
+from requests.auth import HTTPBasicAuth
+from bs4 import BeautifulSoup
+import pandas as pd
+from pandas.io.json import json_normalize
+import airflow
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.hooks.postgres_hook import PostgresHook
+from airflow.hooks.S3_hook import S3Hook
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+DIR_PATH = os.path.dirname(os.path.realpath(__file__))
+FILE_ID = [{'PRIMARY': "JodiOilPrimary.CSV"}, {"SECONDARY": "JodiOilSecondary.csv"}]
+KDS_ID = 'crude-oil-production'
+
+def get_url_data(url):
+    try:
+        url_open = requests.get(url)
+        return url_open.content
+    except ValueError:
+        raise ValueError("Error: Getting the URL content")
+
+def download_file(DIR_PATH, jodi_url):
+    soup = BeautifulSoup(get_url_data(jodi_url), "html.parser")   
+    for link in soup.select('div[id="maincontent"] ul > li > a'):
+        hyperlink = link.get('href')
+        if 'primary' in hyperlink or 'secondary' in hyperlink:
+            download_link_with_query = urlparse(urljoin(jodi_url.rsplit('/', 3)[0], hyperlink))
+            download_link_without_query = download_link_with_query.scheme + "://" + download_link_with_query.netloc + download_link_with_query.path
+            filename = hyperlink.rsplit('/', 1)[-1].rsplit('?', 1)[0]
+            download_folder = os.path.join(DIR_PATH, '_Input')
+            try:
+                download_file_content(download_link_without_query, download_folder, filename)
+                unZip(DIR_PATH, filename)
+                clear_folders(DIR_PATH, '_Input', filename)
+            except ValueError:
+                raise ValueError('Error 404: Issue with the file download')
+    return
+
+def download_file_content(url, folder, fileName):
+    try:
+        r = requests.get(url, stream=True)
+        zipFile = open(os.path.join(folder, fileName), 'wb')
+        zipFile.write(r.content)
+        zipFile.close()
+        return
+    except ValueError:
+        raise ValueError("Error 404: Issue while downloading the actual file")
+
+def unZip(DIR_PATH, FILE_NAME):
+    zip_ref = zipfile.ZipFile(os.path.join(DIR_PATH, '_Input', FILE_NAME)) 
+    zip_ref.extractall(os.path.join(DIR_PATH, '_Input'))
+    zip_ref.close()
+    return
+
+def data_processing(DIR_PATH, file_uuid, country_list):
+    for csv_file in os.listdir(os.path.join(DIR_PATH, '_Input')):
+        if "Primary" in csv_file:
+            primary_df = pd.read_csv(os.path.join(DIR_PATH, '_Input', csv_file))
+            primary_df = primary_df[primary_df.REF_AREA.isin(country_list.split(','))]
+            primary_df['file_type'] = 'Primary'
+            clear_folders(DIR_PATH, '_Input', csv_file)
+        elif "Secondary" in csv_file:
+            secondary_df = pd.read_csv(os.path.join(DIR_PATH, '_Input', csv_file))
+            secondary_df = secondary_df[secondary_df.REF_AREA.isin(country_list.split(','))]
+            secondary_df['file_type'] = 'Secondary'
+            clear_folders(DIR_PATH, '_Input', csv_file)
+    jodi_df = primary_df.append(secondary_df,ignore_index=True)
+    jodi_df = dataframe_mapping(jodi_df)
+
+    # Basic Processing
+    # jodi_df = jodi_df.drop(['ALPHA_3_CODE', 'NUMERIC_CODE'], axis =1) # These columns are missing ==> Updated on 09/01/2019 by Anup Kumar
+    jodi_df['YEAR'], jodi_df['MONTH'] = zip(*jodi_df['TIME_PERIOD'].map(lambda x: x.split('-')))
+    jodi_df['MONTH']=jodi_df.MONTH.astype(int)
+    jodi_df['MONTH']=jodi_df['MONTH'].apply(lambda x: calendar.month_name[x])
+    
+    jodi_df.to_csv(os.path.join(DIR_PATH, '_Output', file_uuid + '.csv'),index=False)
+    return
+
+def dataframe_mapping(data_frame):
+    json_file = json.load(open(os.path.join(DIR_PATH, '_Mapping', 'jodi_energy_product_mapping.json')))
+    mapping_df = pd.io.json.json_normalize(json_file)
+    data_frame =pd.merge(data_frame,mapping_df, on='ENERGY_PRODUCT', how='left')
+    del data_frame['ENERGY_PRODUCT']
+    return data_frame
+
+def get_datasets():
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT file_uuid, jodi_url, country_list FROM lkp.jodi")
+    columns = [column[0] for column in src_cursor.description]
+    datasets = [dict(zip(columns, row)) for row in src_cursor.fetchall()]
+    src_cursor.close()
+    src_conn.close()
+    return datasets
+
+def clear_folders(DIR_PATH, FOLDER_NAME, FILE_NAME):
+    try:
+        os.remove(os.path.join(DIR_PATH, FOLDER_NAME, FILE_NAME))
+        return "Success"
+    except ValueError:
+        raise ValueError("Unable to remove the input file")
+
+def push_to_aws(kds_id):
+    s3_hook = S3Hook(aws_conn_id='s3_conn')
+    s3_hook.get_conn()
+    local_path = os.path.join(DIR_PATH, '_Output', kds_id+'.csv')
+    s3_hook.load_file(filename=local_path, key=kds_id+'.csv', bucket_name=Variable.get("s3_datasets_bucket_name"), replace=True)
+    return "Sucess: Pushed the output"
+
+def get_dataset_uid(dataset_id):
+    try:
+        res = requests.get(Variable.get("kds_api_url") + "catalog/datasets/" + dataset_id, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res.json()['dataset']['dataset_uid']
+    except ValueError:
+        raise ValueError("Error: While getting the dataset uid")
+
+def update_dataset_metadata(uid, template, metadata_name, attribute, value):
+    payload = '{"value": "'+value+'" , "override_remote_value": true}'
+    try:
+        res = requests.put(Variable.get("kds_api_management_url") + '/' + uid + '/' + template + '/' + metadata_name + '/' + attribute, data=payload, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res
+    except ValueError:
+        raise ValueError("Error while updating metadata on KDS")
+
+def publish(dataset_id):
+    dataset_uid = get_dataset_uid(dataset_id)
+    update_metadata = update_dataset_metadata(dataset_uid, 'metadata', 'custom', 'last-checked-date', datetime.datetime.now().strftime("%Y-%m-%d"))
+    if update_metadata.status_code == 200:
+        try:
+            response = requests.put(Variable.get("kds_api_management_url") + '/' + dataset_uid + '/publish/', auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+            return response.json()
+        except ValueError:
+            raise ValueError("Error while publishing the dataset_uid")
+
+def each_id_dag(DIR_PATH, dataset, main_dag_id, start_date, schedule_interval):
+    dag = DAG(
+    '%s.%s' % (main_dag_id, str(dataset['file_uuid'])),
+    schedule_interval=schedule_interval,
+    start_date=start_date,
+    )
+
+    file_download = PythonOperator(
+                    task_id = 'download_file',
+                    python_callable=download_file,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'jodi_url': dataset['jodi_url']},
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+    process_dataset = PythonOperator(
+                    task_id = 'process_dataset',
+                    python_callable=data_processing,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'file_uuid': dataset['file_uuid'], 'country_list': dataset['country_list'] },
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+    load_dataset_to_aws = PythonOperator(
+                    task_id="push_to_aws", 
+                    python_callable=push_to_aws,
+                    op_kwargs={'kds_id': dataset['file_uuid']},
+                    dag=dag
+                )
+
+    publish_dataset = PythonOperator(
+                    task_id="PublishDataset", 
+                    python_callable=publish,
+                    op_kwargs={'dataset_id': KDS_ID},
+                    dag=dag
+                )
+
+    clear_outputs = PythonOperator(
+                    task_id="ClearOutput", 
+                    python_callable=clear_folders,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Output', 'FILE_NAME': str(dataset['file_uuid'])+'.csv'},
+                    dag=dag
+                )
+
+    file_download >> process_dataset >> load_dataset_to_aws >> publish_dataset >> clear_outputs
+    return dag
+
+default_args = {
+    'owner': 'Anup Kumar',
+    'depends_on_past': False,
+    'start_date': airflow.utils.dates.days_ago(1),
+    'email': [Variable.get("alert_email_to")],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': datetime.timedelta(minutes=10)
+}
+
+main_dag = DAG(
+    'JODI',
+    default_args=default_args,
+    description='Joint Organisations Data Initiative',
+    schedule_interval='31 5 * * *',
+)
+
+start_task = DummyOperator(task_id="Start", dag=main_dag)
+end_task = DummyOperator(task_id="End", dag=main_dag)
+
+datasets = get_datasets()
+for dataset in datasets:
+    sub_dag = SubDagOperator(
+            subdag=each_id_dag(DIR_PATH, dataset, 'JODI', main_dag.default_args['start_date'], main_dag.schedule_interval),
+            task_id=str(dataset['file_uuid']),
+            dag=main_dag,
+        )
+
+    start_task >> sub_dag >> end_task

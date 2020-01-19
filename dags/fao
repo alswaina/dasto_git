@@ -1,0 +1,198 @@
+#-------------------------------------- Chnage Log -------------------------------------------
+__author__ = "Anup Kumar"
+__copyright__ = "Copyright 2017, KAPSARC EIM Project"
+__credits__ = ["Anup Kumar"]
+__license__ = "Prop"
+__version__ = "1.0.0"
+__maintainer__ = "Anup Kumar"
+__email__ = "anup.kumar@kapsarc.org"
+__status__ = "Production"
+#------------------------------------ Change Details ------------------------------------------
+# 11/01/2017 - Anup Kumar - Downloading the FAO datasets, unzipping and renaming it to the kds-id
+# 08/04/2019 - Anup Kumar - Migration to airflow
+# 09/09/2019 - Anup Kumar - Fixed the bug in related to deleted datasets by implementing the exclusion bool field
+# 09/10/2019 - Anup Kumar - Updated the FTP to AWS
+#----------------------------------------------------------------------------------------------
+
+import os, requests, time, csv, datetime, sys, zipfile, json
+from urllib.request import urlopen, urlretrieve
+from urllib.parse import quote
+from requests.auth import HTTPBasicAuth
+import airflow
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.hooks.postgres_hook import PostgresHook
+from airflow.hooks.S3_hook import S3Hook
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+DIR_PATH = os.path.abspath(os.path.dirname(__file__))
+
+def get_zip_response(fao_url):
+    try:
+        res = requests.get(fao_url)
+        return json.loads(res.content)
+    except ValueError:
+        raise ValueError("Error: Getting the zip json data")
+
+def download_source_data(DIR_PATH, kds_id, ZJson): 
+    ZJson = ZJson.replace("\'", "\"").encode("utf-8")
+    ZJson = json.loads(ZJson)
+    for elem in ZJson['data']:
+        if elem["FileContent"] == "All Data Normalized":
+            zip_file_name = elem["FileName"]
+            try:
+                #Downloading the file
+                urlretrieve(elem["URL"], os.path.join(DIR_PATH, '_Input', zip_file_name))
+                
+                #Unzipping
+                zipped_file = zipfile.ZipFile(os.path.join(DIR_PATH, '_Input', zip_file_name), 'r')
+                zipped_file.extractall(os.path.join(DIR_PATH, '_Output'))
+                zipped_file.close()
+
+                #Renaming the file to the respective kds-id
+                if os.path.exists(os.path.join(DIR_PATH, '_Output', zip_file_name.split(".zip")[0] + '.csv')):
+                    os.rename(os.path.join(DIR_PATH, '_Output', zip_file_name.split(".zip")[0] + '.csv'), os.path.join(DIR_PATH, '_Output', kds_id + '.csv'))
+                else:
+                    with zipfile.ZipFile(os.path.join(DIR_PATH, '_Input', zip_file_name), 'r') as f:
+                        os.rename(os.path.join(DIR_PATH, '_Output', f.namelist()[0]), os.path.join(DIR_PATH, '_Output', kds_id + '.csv'))
+
+                # Remove the inputs
+                if os.path.exists(os.path.join(DIR_PATH, '_Input', zip_file_name)):
+                    os.remove(os.path.join(DIR_PATH, '_Input', zip_file_name))
+
+            except ValueError:
+                raise ValueError("Error: Downloading the zipped file")
+    return
+
+def get_datasets():
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT kds_id, fao_url FROM lkp.fao where automation_type = 'PYTHON' and kds_dataset_relation = 'PARENT' and is_excluded = FALSE")
+    columns = [column[0] for column in src_cursor.description]
+    datasets = [dict(zip(columns, row)) for row in src_cursor.fetchall()]
+    src_cursor.close()
+    src_conn.close()
+    return datasets
+
+def clear_folders(DIR_PATH, FOLDER_NAME, FILE_NAME):
+    try:
+        os.remove(os.path.join(DIR_PATH, FOLDER_NAME, FILE_NAME))
+        return "Success"
+    except ValueError:
+        raise ValueError("Unable to remove the input file")
+
+def push_to_aws(kds_id):
+    s3_hook = S3Hook(aws_conn_id='s3_conn')
+    s3_hook.get_conn()
+    local_path = os.path.join(DIR_PATH, '_Output', kds_id+'.csv')
+    s3_hook.load_file(filename=local_path, key=kds_id+'.csv', bucket_name=Variable.get("s3_datasets_bucket_name"), replace=True)
+    return "Sucess: Pushed the output"
+
+def get_dataset_uid(dataset_id):
+    try:
+        res = requests.get(Variable.get("kds_api_url") + "catalog/datasets/" + dataset_id, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res.json()['dataset']['dataset_uid']
+    except ValueError:
+        raise ValueError("Error: While getting the dataset uid")
+
+def update_dataset_metadata(uid, template, metadata_name, attribute, value):
+    payload = '{"value": "'+value+'" , "override_remote_value": true}'
+    try:
+        res = requests.put(Variable.get("kds_api_management_url") + '/' + uid + '/' + template + '/' + metadata_name + '/' + attribute, data=payload, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res
+    except ValueError:
+        raise ValueError("Error while updating metadata on KDS")
+
+def publish(dataset_id):
+    dataset_uid = get_dataset_uid(dataset_id)
+    update_metadata = update_dataset_metadata(dataset_uid, 'metadata', 'custom', 'last-checked-date', datetime.datetime.now().strftime("%Y-%m-%d"))
+    if update_metadata.status_code == 200:
+        try:
+            response = requests.put(Variable.get("kds_api_management_url") + '/' + dataset_uid + '/publish/', auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+            return response.json()
+        except ValueError:
+            raise ValueError("Error while publishing the dataset_uid")
+
+def each_id_dag(DIR_PATH, dataset, main_dag_id, start_date, schedule_interval):
+    dag = DAG(
+    '%s.%s' % (main_dag_id, str(dataset['kds_id'])),
+    schedule_interval=schedule_interval,
+    start_date=start_date,
+    )
+
+    extract_zjson = PythonOperator(
+                    task_id = 'extract_zjson',
+                    python_callable=get_zip_response,
+                    op_kwargs={'fao_url': dataset['fao_url']},
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+    process_dataset = PythonOperator(
+                    task_id = 'process_dataset',
+                    python_callable=download_source_data,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'kds_id': dataset['kds_id'], 'ZJson': "{{ task_instance.xcom_pull(task_ids='extract_zjson', key='return_value') }}" },
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+    load_dataset_to_aws = PythonOperator(
+                    task_id="push_to_aws", 
+                    python_callable=push_to_aws,
+                    op_kwargs={'kds_id': dataset['kds_id']},
+                    dag=dag
+                )
+
+    publish_dataset = PythonOperator(
+                    task_id="PublishDataset", 
+                    python_callable=publish,
+                    op_kwargs={'dataset_id': dataset['kds_id']},
+                    dag=dag
+                )
+
+    clear_outputs = PythonOperator(
+                    task_id="ClearOutput", 
+                    python_callable=clear_folders,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Output', 'FILE_NAME': str(dataset['kds_id'])+'.csv'},
+                    dag=dag
+                )
+
+    extract_zjson >> process_dataset >> load_dataset_to_aws >> publish_dataset >> clear_outputs
+    return dag
+
+default_args = {
+    'owner': 'Anup Kumar',
+    'depends_on_past': False,
+    'start_date': airflow.utils.dates.days_ago(1),
+    'email': [Variable.get("alert_email_to")],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': datetime.timedelta(minutes=10)
+}
+
+main_dag = DAG(
+    'FAO',
+    default_args=default_args,
+    description='Food and Agriculture Organization',
+    schedule_interval='45 4 * * *',
+)
+
+start_task = DummyOperator(task_id="Start", dag=main_dag)
+end_task = DummyOperator(task_id="End", dag=main_dag)
+
+datasets = get_datasets()
+for dataset in datasets:
+    sub_dag = SubDagOperator(
+            subdag=each_id_dag(DIR_PATH, dataset, 'FAO', main_dag.default_args['start_date'], main_dag.schedule_interval),
+            task_id=str(dataset['kds_id']),
+            dag=main_dag,
+        )
+
+    start_task >> sub_dag >> end_task

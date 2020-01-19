@@ -1,0 +1,305 @@
+#-------------------------------------- Chnage Log -------------------------------------------
+__author__ = "Anup Kumar"
+__copyright__ = "Copyright 2017, KAPSARC EIM Project"
+__credits__ = ["Anup Kumar"]
+__license__ = "Prop"
+__version__ = "1.0.0"
+__maintainer__ = "Anup Kumar"
+__email__ = "anup.kumar@kapsarc.org"
+__status__ = "Production"
+#------------------------------------ Change Details ------------------------------------------
+# 11/16/2017 - Anup Kumar - Download BP file to inputs folder
+# 02/28/2018 - Anup Kumar - Fixed the issue with SSL
+# 07/30/2019 - Anup Kumar - Integrated Airflow, fixed the issues with url and the output generation process
+# 09/10/2019 - Anup Kumar - Updated the FTP to AWS
+#----------------------------------------------------------------------------------------------
+import os, requests, sys, re, datetime, time
+from requests.auth import HTTPBasicAuth
+from urllib.parse import urlparse, urljoin, quote
+from urllib.request import urlretrieve
+from bs4 import BeautifulSoup
+import pandas as pd
+import numpy as np
+import airflow
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.hooks.postgres_hook import PostgresHook
+from airflow.hooks.S3_hook import S3Hook
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+DIR_PATH = os.path.abspath(os.path.dirname(__file__))
+WB_URL = 'https://www.bp.com/content/dam/bp/business-sites/en/global/corporate/xlsx/energy-economics/statistical-review/bp-stats-review-2019-all-data.xlsx'
+INPUT_FILE_NAME = 'bp_stats_review.xlsx'
+
+def download_file(DIR_PATH, WB_URL, INPUT_FILE_NAME):
+    try:
+        urlretrieve(WB_URL, os.path.join(DIR_PATH, '_Input', INPUT_FILE_NAME))
+    except e:
+        print ('Error 404: Issue with the file download', e)
+    return
+
+def generate_output(DIR_PATH, KDS_ID, TYPE_CODE, SOURCE_SHEET_NAME, HEADER_DIM, VALUE_DIM, SKIP_INTIAL_ROWS, MERGE_UNTIL_ROW_NUM):
+    for file in os.listdir(os.path.join(DIR_PATH, '_Input')):
+            if file.startswith('bp_stats_review') and (time.strftime('%m/%d/%Y', time.gmtime(os.path.getmtime(os.path.join(DIR_PATH, '_Input', file)))) == time.strftime('%m/%d/%Y', time.gmtime(time.time()))):
+                inp_file = file
+    if TYPE_CODE == 'HWL3':
+        df = pd.read_excel(os.path.join(DIR_PATH, '_Input', inp_file), sheet_name=SOURCE_SHEET_NAME, skiprows=SKIP_INTIAL_ROWS)
+
+        df[df.columns[0]] = df[df.columns[0]].str.strip()
+        df = df.dropna(subset=[df.columns[1]], how='all')
+        df.drop(list(df.filter(regex = 'Unnamed')), axis=1, inplace=True)
+
+        df.columns.values[len(df.columns) - 3] = 'Growth rate per annum' + ' ' + trim_val_by_delim(df.columns[len(df.columns) - 3], '.', 0)
+        df.columns.values[len(df.columns) - 2] = 'Growth rate per annum' + ' ' + trim_val_by_delim(df.columns[len(df.columns) - 2], '.', 0)
+        df.columns.values[len(df.columns) - 1] = 'Share' + ' ' + trim_val_by_delim(df.columns[len(df.columns) - 1], '.', 0)
+        
+        df = df.dropna(axis=0, how='all')
+        df = df[~df[df.columns[0]].astype(str).str.startswith('Total')]
+        
+        col_list = [x for x in df.columns.values if not isinstance(x, int)]
+        dfMelt = pd.melt(df, id_vars=col_list, var_name=HEADER_DIM, value_name=VALUE_DIM)
+
+        dfMelt[VALUE_DIM] = pd.to_numeric(dfMelt[VALUE_DIM].astype(str).str.replace(',',''), errors='coerce').fillna(0)
+
+        dfMelt.to_csv(os.path.join(DIR_PATH, '_Output', KDS_ID + '.csv'),mode = 'w', index=False)
+    elif TYPE_CODE == 'DRT':
+        df = pd.read_excel(os.path.join(DIR_PATH, '_Input', inp_file), sheet_name=SOURCE_SHEET_NAME, skiprows=SKIP_INTIAL_ROWS)
+        
+        df.columns = df.iloc[0:MERGE_UNTIL_ROW_NUM].fillna('').apply(' '.join).str.strip()
+        df = df.iloc[MERGE_UNTIL_ROW_NUM:].reset_index(drop=True)
+        df = df.dropna(subset=[df.columns[1]], how='all')
+        df = df.dropna(axis=0, how='all')
+        df.drop(list(df.filter(regex = 'Unnamed')), axis=1, inplace=True)
+
+        df = df[~df[df.columns[0]].astype(str).str.startswith('Total')]
+        df.ix[1:, df.columns != df.columns[0]] = df.ix[1:, df.columns != df.columns[0]].apply(pd.to_numeric, errors='coerce').fillna(0).astype(float)
+        
+        df.to_csv(os.path.join(DIR_PATH, '_Output', KDS_ID + '.csv'),mode = 'w', index=False, encoding='utf-8')
+    elif TYPE_CODE == 'HWHM':
+        df = pd.read_excel(os.path.join(DIR_PATH, '_Input', inp_file), sheet_name=SOURCE_SHEET_NAME, skiprows=SKIP_INTIAL_ROWS)
+        
+        df.columns = df.iloc[0:MERGE_UNTIL_ROW_NUM].fillna('').apply(' '.join).str.strip()
+        df.columns = [x.encode('utf-8').decode('ascii', 'ignore').strip() for x in df.columns.tolist()]
+        df = df.iloc[MERGE_UNTIL_ROW_NUM:].reset_index(drop=True)
+        
+        df = df.dropna(subset=[df.columns[1]], how='all')
+        
+        df = df.dropna(axis=0, how='all')
+        
+        df = df[~df[df.columns[0]].astype(str).str.startswith('Total')]
+        df.drop(list(df.filter(regex = 'Unnamed')), axis=1, inplace=True)
+        
+        dfMelt = pd.melt(df, id_vars=df.columns[:1].get_values().tolist(), var_name=HEADER_DIM, value_name=VALUE_DIM)
+        
+        dfMelt[VALUE_DIM] = pd.to_numeric(dfMelt[VALUE_DIM].astype(str).str.replace(',',''), errors='coerce').fillna(0)
+        
+        dfMelt.to_csv(os.path.join(DIR_PATH, '_Output', KDS_ID + '.csv'),mode = 'w', index=False)
+    elif TYPE_CODE == 'HWNN':
+        df = pd.read_excel(os.path.join(DIR_PATH, '_Input', inp_file), sheet_name=SOURCE_SHEET_NAME, skiprows=SKIP_INTIAL_ROWS)
+        
+        df = df.dropna(subset=[df.columns[1]], how='all')
+        df = df.dropna(axis=0, how='all')
+        df = df[~df[df.columns[0]].astype(str).str.startswith('Total')]
+        df.drop(list(df.filter(regex = 'Unnamed')), axis=1, inplace=True)
+        
+        dfMelt = pd.melt(df, id_vars=df.columns[:1].get_values().tolist(), var_name=HEADER_DIM, value_name=VALUE_DIM)
+        
+        dfMelt[VALUE_DIM] = pd.to_numeric(dfMelt[VALUE_DIM].astype(str).str.replace(',',''), errors='coerce').fillna(0)
+        
+        dfMelt.to_csv(os.path.join(DIR_PATH, '_Output', KDS_ID + '.csv'),mode = 'w', index=False, encoding='utf-8')
+    elif TYPE_CODE == 'MHWL2':
+        df = pd.read_excel(os.path.join(DIR_PATH, '_Input', inp_file), sheet_name=SOURCE_SHEET_NAME, skiprows=SKIP_INTIAL_ROWS)
+        df = df.dropna(axis=0, how='all')
+        df.drop(list(df.filter(regex = 'Unnamed')), axis=1, inplace=True)
+        if KDS_ID == 'oil-trade-movement':
+            row_num = df.loc[df['Thousand barrels daily']=='Total World'].index[0]
+            df_01 = df.iloc[:row_num + 1, :]
+            df_02 = df.iloc[row_num + 1:, :]
+            
+            df_01 = df_01.dropna(subset=[df_01.columns[1]], how='all')
+            df_01.columns.values[len(df_01.columns) - 3] = 'Growth rate per annum' + ' ' + trim_val_by_delim(df_01.columns[len(df_01.columns) - 3], '.', 0)
+            df_01.columns.values[len(df_01.columns) - 2] = 'Growth rate per annum' + ' ' + trim_val_by_delim(df_01.columns[len(df_01.columns) - 2], '.', 0)
+            df_01.columns.values[len(df_01.columns) - 1] = 'Share' + ' ' + trim_val_by_delim(df_01.columns[len(df_01.columns) - 1], '.', 0)
+            df_01 = df_01.dropna(axis=0, how='all')
+            df_01 = df_01[~df_01[df_01.columns[0]].astype(str).str.startswith('Total')]
+            df_01['Type'] = 'Imports'
+
+            df_02 = df_02.dropna(subset=[df_02.columns[1]], how='all')
+            df_02.columns.values[len(df_02.columns) - 3] = df_02.columns[len(df_02.columns) - 3]
+            df_02.columns.values[len(df_02.columns) - 2] = df_02.columns[len(df_02.columns) - 2]
+            df_02.columns.values[len(df_02.columns) - 1] = df_02.columns[len(df_02.columns) - 1]
+            df_02 = df_02.dropna(axis=0, how='all')
+            df_02 = df_02[~df_02[df_02.columns[0]].astype(str).str.startswith('Total')]
+            df_02['Type'] = 'Exports'
+
+            dfs = pd.concat([df_01, df_02], ignore_index=True)
+            col_list = [x for x in dfs.columns.get_values().tolist() if not isinstance(x, int)]
+            dfMelt = pd.melt(dfs, id_vars=col_list, var_name=HEADER_DIM, value_name=VALUE_DIM)
+            dfMelt[VALUE_DIM] = pd.to_numeric(dfMelt[VALUE_DIM].astype(str).str.replace(',',''), errors='coerce').fillna(0)
+            dfMelt.ix[1:, dfMelt.columns != dfMelt.columns[0]] = dfMelt.ix[1:, dfMelt.columns != dfMelt.columns[0]].apply(pd.to_numeric, errors='coerce').fillna(0).astype(float)
+            dfMelt.to_csv(os.path.join(DIR_PATH, '_Output', KDS_ID + '.csv'),mode = 'w', index=False)
+        elif KDS_ID == 'crude-oil-inter-area-movements-million-tonnes-2015':
+            row_num = df.loc[df['Crude (million tonnes)']=='Total imports'].index[0]
+            df_01 = df.iloc[:row_num + 1, :]
+            df_02 = df.iloc[row_num + 1:, :]
+
+            df_01 = df_01.dropna(subset=[df_01.columns[1]], how='all')
+            df_01 = df_01.dropna(axis=0, how='all')
+            df_01 = df_01[~df_01[df_01.columns[0]].astype(str).str.startswith('Total')]
+            df_01['Type'] = 'Crude (million tonnes)'
+
+            df_02 = df_02.dropna(subset=[df_02.columns[1]], how='all')
+            df_02 = df_02.dropna(axis=0, how='all')
+            df_02 = df_02[~df_02[df_02.columns[0]].astype(str).str.startswith('Total')]
+            df_02['Type'] = 'Product (million tonnes)'
+
+            dfs = pd.concat([df_01, df_02], ignore_index=True)
+            dfMelt = pd.melt(dfs, id_vars=[dfs.columns[0], 'Type'], var_name=HEADER_DIM, value_name=VALUE_DIM)
+            dfMelt[VALUE_DIM] = pd.to_numeric(dfMelt[VALUE_DIM].astype(str).str.replace(',',''), errors='coerce').fillna(0)
+            dfMelt.to_csv(os.path.join(DIR_PATH, '_Output', KDS_ID + '.csv'),mode = 'w', index=False, encoding='utf-8')
+    return
+
+def trim_val_by_delim(tval, delim, posi):
+    return tval.split(delim)[posi] if delim in tval else tval
+
+def get_list_of_datasets():
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute("SELECT kds_id, type_code, bp_sheet_name, bp_skip_intial_rows, bp_merge_until_row_num, header_dimension, value_dimension FROM lkp.bp where automation_type = 'PYTHON' and is_excluded = FALSE")
+    columns = [column[0] for column in src_cursor.description]
+    datasets_list = [dict(zip(columns, row)) for row in src_cursor.fetchall()]
+    src_cursor.close()
+    src_conn.close()
+    return datasets_list
+
+def get_dataset_uid(dataset_id):
+    try:
+        res = requests.get(Variable.get("kds_api_url") + "catalog/datasets/" + dataset_id, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res.json()['dataset']['dataset_uid']
+    except Exception as e:
+        print ('Error: While getting the dataset uid - ', e.message)
+        return
+
+def update_dataset_metadata(uid, template, metadata_name, attribute, value):
+    payload = '{"value": "'+value+'" , "override_remote_value": true}'
+    try:
+        res = requests.put(Variable.get("kds_api_management_url") + '/' + uid + '/' + template + '/' + metadata_name + '/' + attribute, data=payload, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res
+    except Exception as e:
+        print ("Error while updating ", e)
+        return
+
+def publish(dataset_id):
+    dataset_uid = get_dataset_uid(dataset_id)
+    update_metadata = update_dataset_metadata(dataset_uid, 'metadata', 'custom', 'last-checked-date', datetime.datetime.now().strftime("%Y-%m-%d"))
+    if update_metadata.status_code == 200:
+        try:
+            response = requests.put(Variable.get("kds_api_management_url") + '/' + dataset_uid + '/publish/', auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+            return response.json()
+        except Exception as e:
+            print ("Error while publishing the dataset_uid ", dataset_uid)
+            return
+
+def clear_folders(DIR_PATH, FOLDER_NAME, FILE_NAME):
+    try:
+        os.remove(os.path.join(DIR_PATH, FOLDER_NAME, FILE_NAME))
+    except Exception as e:
+        print ("Unable to remove the input file - ", e)
+    return
+
+def push_to_aws(kds_id):
+    s3_hook = S3Hook(aws_conn_id='s3_conn')
+    s3_hook.get_conn()
+    local_path = os.path.join(DIR_PATH, '_Output', kds_id+'.csv')
+    s3_hook.load_file(filename=local_path, key=kds_id+'.csv', bucket_name=Variable.get("s3_datasets_bucket_name"), replace=True)
+    return
+
+def each_id_dag(DIR_PATH, bp_dataset_details, main_dag_id, start_date, schedule_interval):
+    dag = DAG(
+    '%s.%s' % (main_dag_id, bp_dataset_details['kds_id']),
+    schedule_interval=schedule_interval,
+    start_date=start_date,
+    )
+
+    process_dataset = PythonOperator(
+        task_id = 'process_dataset',
+        python_callable=generate_output,
+        op_kwargs={'DIR_PATH': DIR_PATH, 'KDS_ID': bp_dataset_details['kds_id'], 'TYPE_CODE': bp_dataset_details['type_code'], 'SOURCE_SHEET_NAME': bp_dataset_details['bp_sheet_name'], 'HEADER_DIM': bp_dataset_details['header_dimension'], 'VALUE_DIM': bp_dataset_details['value_dimension'], 'SKIP_INTIAL_ROWS': int(bp_dataset_details['bp_skip_intial_rows']), 'MERGE_UNTIL_ROW_NUM': int(bp_dataset_details['bp_merge_until_row_num'])},
+        start_date=airflow.utils.dates.days_ago(0),
+        dag=dag
+    )
+
+    load_dataset_to_aws = PythonOperator(
+                    task_id="push_to_aws", 
+                    python_callable=push_to_aws,
+                    op_kwargs={'kds_id': bp_dataset_details['kds_id']},
+                    dag=dag
+                )
+
+    publish_dataset = PythonOperator(
+                    task_id="PublishDataset", 
+                    python_callable=publish,
+                    op_kwargs={'dataset_id': bp_dataset_details['kds_id']},
+                    dag=dag
+                )
+
+    clear_outputs = PythonOperator(
+                    task_id="ClearOutputs", 
+                    python_callable=clear_folders,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Output', 'FILE_NAME': bp_dataset_details['kds_id']+'.csv'},
+                    dag=dag
+                )
+
+    process_dataset >> load_dataset_to_aws >> publish_dataset >> clear_outputs
+    return dag
+
+default_args = {
+    'owner': 'Anup Kumar',
+    'depends_on_past': False,
+    'start_date': airflow.utils.dates.days_ago(1),
+    'email': [Variable.get("alert_email_to")],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': datetime.timedelta(minutes=10)
+}
+
+main_dag = DAG(
+    'BritishPetroleum',
+    default_args=default_args,
+    description='British Petroleum',
+    schedule_interval='10 10 * * *',
+)
+
+start_task = DummyOperator(task_id="Start", dag=main_dag)
+end_task = DummyOperator(task_id="End", dag=main_dag)
+
+download_file = PythonOperator(
+                            task_id="DownloadFile", 
+                            python_callable=download_file,
+                            op_kwargs={'DIR_PATH': DIR_PATH, 'WB_URL': WB_URL, 'INPUT_FILE_NAME': INPUT_FILE_NAME},
+                            dag=main_dag
+                        )
+
+clear_inputs = PythonOperator(
+                            task_id="ClearInputs", 
+                            python_callable=clear_folders,
+                            op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Input', 'FILE_NAME': INPUT_FILE_NAME},
+                            dag=main_dag
+                        )
+
+bp_kds_id_list = get_list_of_datasets()
+for bp_kds_id in bp_kds_id_list:
+    sub_dag = SubDagOperator(
+            subdag=each_id_dag(DIR_PATH, bp_kds_id, 'BritishPetroleum', main_dag.default_args['start_date'], main_dag.schedule_interval),
+            task_id=bp_kds_id['kds_id'],
+            dag=main_dag,
+        )
+
+    start_task >> download_file >> sub_dag >> clear_inputs >> end_task

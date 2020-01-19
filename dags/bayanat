@@ -1,0 +1,194 @@
+# coding: utf-8
+#-------------------------------------- Chnage Log -------------------------------------------
+__author__ = "Anup Kumar"
+__copyright__ = "Copyright 2019, KAPSARC EIM Project"
+__credits__ = ["Anup Kumar"]
+__license__ = "Prop"
+__version__ = "1.0.0"
+__maintainer__ = "Anup Kumar"
+__email__ = "anup.kumar@kapsarc.org"
+__status__ = "Production"
+#------------------------------------ Change Details ------------------------------------------
+# 04/25/2018 - Linah Hamdan - Downloading the bayant datasets
+# 08/01/2019 - Anup Kumar - Migratied to Airflow
+# 09/10/2019 - Anup Kumar - Updated the FTP to AWS
+#----------------------------------------------------------------------------------------------
+
+import os, requests, time, csv, datetime
+from requests.auth import HTTPBasicAuth
+import airflow
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.hooks.postgres_hook import PostgresHook
+from airflow.hooks.S3_hook import S3Hook
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+DIR_PATH = os.path.abspath(os.path.dirname(__file__))
+BAY_URL="http://data.bayanat.ae/api/action/datastore_search?resource_id="
+
+#Get The Json Data from BAYANAT URL
+def get_json(BAY_URL, BAY_RESOURCE_ID):
+    total_records = get_record_count(BAY_URL, BAY_RESOURCE_ID)
+    print (total_records)
+    print (type(total_records))
+    try:
+        res = requests.get(BAY_URL + BAY_RESOURCE_ID + "&limit="+str(total_records))
+        return res.json()
+    except ValueError:
+        raise ValueError("Error: While getting the json from bayanat for the resource id")
+
+# Get the total records count
+def get_record_count(BAY_URL, BAY_RESOURCE_ID):
+    try:
+        res = requests.get(BAY_URL+BAY_RESOURCE_ID)
+        return res.json()['result']['total']
+    except ValueError:
+        raise ValueError("Error: While getting record count")
+
+#Data Processing and saving into a csv file
+def process_data(DIR_PATH, BAY_URL, BAY_RESOURCE_ID, KDS_ID):
+    datum = get_json(BAY_URL, BAY_RESOURCE_ID)
+    with open(os.path.join(DIR_PATH, '_Output', KDS_ID + ".csv"), "w") as csvfile:
+        writer = csv.writer(csvfile, lineterminator='\n')
+
+        #Apply utf-8 on the value And Remove Arabic columns
+        data=[]
+        for row in datum["result"]["records"]:
+            data.append({ k: str(v).encode("utf-8") for k,v in row.items() if not k.lower().endswith("_ar")})
+
+        #Write Data to CSV file
+        for index, row in enumerate(data):
+            if index==0:
+                #write Header
+                writer.writerow(row.keys())
+                #write First row
+                writer.writerow(row.values())
+            else:
+                #write rows
+                writer.writerow(row.values())
+    return
+
+def get_datasets():
+    pg_db = PostgresHook(postgres_conn_id='pg_id_framework')
+    src_conn = pg_db.get_conn()
+    src_cursor = src_conn.cursor()
+    src_cursor.execute('SELECT kds_id, bay_resource_id FROM lkp.bayanat')
+    columns = [column[0] for column in src_cursor.description]
+    datasets = [dict(zip(columns, row)) for row in src_cursor.fetchall()]
+    src_cursor.close()
+    src_conn.close()
+    return datasets
+
+def clear_folders(DIR_PATH, FOLDER_NAME, FILE_NAME):
+    try:
+        os.remove(os.path.join(DIR_PATH, FOLDER_NAME, FILE_NAME))
+        return "Success"
+    except ValueError:
+        raise ValueError("Unable to remove the input file")
+
+def push_to_aws(kds_id):
+    s3_hook = S3Hook(aws_conn_id='s3_conn')
+    s3_hook.get_conn()
+    local_path = os.path.join(DIR_PATH, '_Output', kds_id+'.csv')
+    s3_hook.load_file(filename=local_path, key=kds_id+'.csv', bucket_name=Variable.get("s3_datasets_bucket_name"), replace=True)
+    return "Sucess: Pushed the output"
+
+def get_dataset_uid(dataset_id):
+    try:
+        res = requests.get(Variable.get("kds_api_url") + "catalog/datasets/" + dataset_id, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res.json()['dataset']['dataset_uid']
+    except ValueError:
+        raise ValueError("Error: While getting the dataset uid")
+
+def update_dataset_metadata(uid, template, metadata_name, attribute, value):
+    payload = '{"value": "'+value+'" , "override_remote_value": true}'
+    try:
+        res = requests.put(Variable.get("kds_api_management_url") + '/' + uid + '/' + template + '/' + metadata_name + '/' + attribute, data=payload, auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+        if res.status_code == 200:
+            return res
+    except ValueError:
+        raise ValueError("Error while updating metadata on KDS")
+
+def publish(dataset_id):
+    dataset_uid = get_dataset_uid(dataset_id)
+    update_metadata = update_dataset_metadata(dataset_uid, 'metadata', 'custom', 'last-checked-date', datetime.datetime.now().strftime("%Y-%m-%d"))
+    if update_metadata.status_code == 200:
+        try:
+            response = requests.put(Variable.get("kds_api_management_url") + '/' + dataset_uid + '/publish/', auth=HTTPBasicAuth(Variable.get("kds_auth_email").strip(), Variable.get("kds_auth_password").strip()))
+            return response.json()
+        except ValueError:
+            raise ValueError("Error while publishing the dataset_uid")
+
+def each_id_dag(DIR_PATH, dataset, main_dag_id, start_date, schedule_interval):
+    dag = DAG(
+    '%s.%s' % (main_dag_id, str(dataset['kds_id'])),
+    schedule_interval=schedule_interval,
+    start_date=start_date,
+    )
+
+    process_dataset = PythonOperator(
+                    task_id = 'process_dataset',
+                    python_callable=process_data,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'BAY_URL': BAY_URL, 'BAY_RESOURCE_ID': dataset['bay_resource_id'], 'KDS_ID': dataset['kds_id']},
+                    start_date=airflow.utils.dates.days_ago(0),
+                    dag=dag
+                )
+
+    load_dataset_to_aws = PythonOperator(
+                    task_id="push_to_aws", 
+                    python_callable=push_to_aws,
+                    op_kwargs={'kds_id': dataset['kds_id']},
+                    dag=dag
+                )
+
+    publish_dataset = PythonOperator(
+                    task_id="PublishDataset", 
+                    python_callable=publish,
+                    op_kwargs={'dataset_id': dataset['kds_id']},
+                    dag=dag
+                )
+
+    clear_outputs = PythonOperator(
+                    task_id="ClearOutput", 
+                    python_callable=clear_folders,
+                    op_kwargs={'DIR_PATH': DIR_PATH, 'FOLDER_NAME': '_Output', 'FILE_NAME': str(dataset['kds_id'])+'.csv'},
+                    dag=dag
+                )
+
+    process_dataset >> load_dataset_to_aws >> publish_dataset >> clear_outputs
+    return dag
+
+default_args = {
+    'owner': 'Anup Kumar',
+    'depends_on_past': False,
+    'start_date': airflow.utils.dates.days_ago(1),
+    'email': [Variable.get("alert_email_to")],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': datetime.timedelta(minutes=10)
+}
+
+main_dag = DAG(
+    'Bayanat',
+    default_args=default_args,
+    description='UAE Open Data Portal',
+    schedule_interval='30 6 * * *',
+)
+
+start_task = DummyOperator(task_id="Start", dag=main_dag)
+end_task = DummyOperator(task_id="End", dag=main_dag)
+
+datasets = get_datasets()
+for dataset in datasets:
+    sub_dag = SubDagOperator(
+            subdag=each_id_dag(DIR_PATH, dataset, 'Bayanat', main_dag.default_args['start_date'], main_dag.schedule_interval),
+            task_id=str(dataset['kds_id']),
+            dag=main_dag,
+        )
+
+    start_task >> sub_dag >> end_task
